@@ -14,7 +14,7 @@ where they add value**:
 
 ---
 
-## Phase 0: Setup
+## Phase 0: Setup ✅ Completed 2026-11-24
 **Goal:** a working environment and a "hello world" for every component.
 - git repo, Python environment, project folder layout
 - Docker + Neo4j running; open the Neo4j browser
@@ -30,7 +30,7 @@ where they add value**:
 > running from a folder without CLAUDE.md, and batching several chunks per call. Check flags
 > with `claude --help`.
 
-## Phase 1: Know the data
+## Phase 1: Know the data ✅ Completed 2026-11-24
 **Goal:** understand the corpus before designing anything.
 - Load all filings, check section quality (empty or broken sections, leftover HTML, tables)
 - Measure: tokens per section, per company, per year
@@ -38,6 +38,15 @@ where they add value**:
   This number tells us how much LLM budget the "only process changes" trick saves.
 
 **You'll learn:** why data profiling comes first and drives the cost estimates.
+
+> **Results** (`src/profile_corpus.py`, details in `data/profile/`):
+> - Quality: 3 broken sections (EVTC 2023 Item 1, ALRM 2015 Item 7A, DBX 2022 Item 1A) → trim/skip
+>   in the Phase 2 loader. Page footers in ~5% of sections, flattened tables in 17 MD&As. No HTML.
+> - Size: **37.7M tokens** (gpt-oss tokenizer). Item 1A = 49%, Item 7 = 29%, Item 1 = 20%.
+> - Repetition vs previous filing: 33% at paragraph level, **57% at sentence level**.
+> - Cost: Claude tokenizer = 1.62× gpt-oss. Days to finish with both backends: ~21–30 without a
+>   filter, **~6–15** if the Phase 3 filter keeps 30–50% of chunks (filter share, prompt/output sizes
+>   and real Claude Pro capacity still to be measured).
 
 ## Phase 2: Structural graph + vector baseline (no LLM)
 **Goal:** a working plain RAG system, used as the baseline to compare against.
