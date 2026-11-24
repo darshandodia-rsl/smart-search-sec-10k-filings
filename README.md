@@ -1,7 +1,7 @@
 # Smart Search over SEC 10-K Filings (GraphRAG)
 
 A GraphRAG system over 10-K filings of 130 US tech companies (fiscal years 2015–2024,
-950 filings, ~55M tokens), built with LlamaIndex and Neo4j. It is a learning project, built the way a
+950 filings, ~38M tokens), built with LlamaIndex and Neo4j. It is a learning project, built the way a
 production team would: resumable, budgeted ingestion and swappable LLM backends.
 
 **Status:** Phase 0 (setup) done. See [`PLAN.md`](PLAN.md) for phases and the progress log.

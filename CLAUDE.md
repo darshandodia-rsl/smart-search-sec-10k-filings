@@ -5,7 +5,7 @@ progress log. This file covers *how* to work.
 
 ## What this project is
 A GraphRAG system over SEC 10-K filings (130 US tech companies, fiscal years 2015–2024,
-950 filings, ~55M tokens). It is a learning project built the way production teams would build it:
+950 filings, ~38M tokens). It is a learning project built the way production teams would build it:
 not a toy demo, but also not full enterprise hardening.
 
 ## Who you're working with
