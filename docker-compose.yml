@@ -1,0 +1,20 @@
+# Neo4j Community for local development.
+# Start: docker compose up -d   |   Stop: docker compose down   |   Browser: http://localhost:7474
+services:
+  neo4j:
+    image: neo4j:5.26-community          # 5.26 = LTS release
+    container_name: neo4j-sec10k
+    ports:
+      - "7474:7474"                      # HTTP: Neo4j Browser (web UI)
+      - "7687:7687"                      # Bolt: the protocol Python drivers use
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      NEO4J_PLUGINS: '["apoc"]'          # LlamaIndex's Neo4jPropertyGraphStore needs APOC
+      # Memory: kept small for a 16 GB laptop shared with the embedding model + Python.
+      NEO4J_server_memory_heap_initial__size: 1G
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 1G
+    volumes:
+      - ./data/neo4j/data:/data          # graph survives container restarts (git-ignored)
+      - ./data/neo4j/logs:/logs
+    restart: unless-stopped

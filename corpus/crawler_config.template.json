@@ -1,0 +1,24 @@
+{
+	"download_filings": {
+		"start_year": 2015,
+		"end_year": 2025,
+		"quarters": [1, 2, 3, 4],
+		"filing_types": ["10-K"],
+		"cik_tickers": "../scripts/ciks.txt",
+		"user_agent": "__SEC_USER_AGENT__",
+		"raw_filings_folder": "../../data/raw",
+		"indices_folder": "../../data/indices",
+		"filings_metadata_file": "../../data/FILINGS_METADATA.csv",
+		"skip_present_indices": true
+	},
+	"extract_items": {
+		"raw_filings_folder": "../../data/raw",
+		"extracted_filings_folder": "../../data/extracted",
+		"filings_metadata_file": "../../data/FILINGS_METADATA.csv",
+		"filing_types": ["10-K"],
+		"include_signature": false,
+		"items_to_extract": ["1", "1A", "7", "7A"],
+		"remove_tables": true,
+		"skip_extracted_filings": true
+	}
+}

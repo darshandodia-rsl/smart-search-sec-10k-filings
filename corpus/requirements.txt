@@ -1,0 +1,15 @@
+# Dependencies for rebuilding the corpus (corpus/*.py + edgar-crawler), Python 3.12.
+# edgar-crawler's own requirements.txt pins old versions that don't install on 3.12;
+# these are the versions verified here to reproduce the extracted text and manifest.
+# Install: .venv/bin/pip install -r corpus/requirements.txt
+beautifulsoup4==4.15.0
+click==8.5.1
+cssutils==2.15.0
+lxml==6.1.3
+numpy==2.5.5
+pandas==3.1.1
+pathos==0.3.5
+python-dotenv==1.2.4
+requests==2.34.2
+tqdm==4.70.1
+urllib3==2.8.0

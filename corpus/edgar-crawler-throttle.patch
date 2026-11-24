@@ -1,0 +1,37 @@
+diff --git a/download_filings.py b/download_filings.py
+index 9384a75..b80350b 100644
+--- a/download_filings.py
++++ b/download_filings.py
+@@ -802,6 +802,23 @@ def download(url: str, filename: str, download_folder: str, user_agent: str) ->
+     return True
+ 
+ 
++import threading, time as _time
++_RL_LOCK = threading.Lock()
++_RL_LAST = [0.0]
++
++
++class _ThrottledAdapter(HTTPAdapter):
++    """LOCAL PATCH: enforce SEC fair-access limit (<=8 requests/second, global)."""
++
++    def send(self, *args, **kwargs):
++        with _RL_LOCK:
++            wait = 0.125 - (_time.time() - _RL_LAST[0])
++            if wait > 0:
++                _time.sleep(wait)
++            _RL_LAST[0] = _time.time()
++        return super().send(*args, **kwargs)
++
++
+ def requests_retry_session(
+     retries: int = 5,
+     backoff_factor: float = 0.5,
+@@ -838,7 +855,7 @@ def requests_retry_session(
+ 
+     # Create an HTTPAdapter with the Retry object
+     # HTTPAdapter is a built-in requests Adapter that sends HTTP requests
+-    adapter = HTTPAdapter(max_retries=retry)
++    adapter = _ThrottledAdapter(max_retries=retry)
+ 
+     # Mount the HTTPAdapter to the session for both HTTP and HTTPS requests
+     session.mount("http://", adapter)

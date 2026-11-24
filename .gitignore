@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets (API keys go in .env, never in git)
+.env
+
+# Corpus + generated data (large, re-downloadable; lives outside version control)
+/data/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

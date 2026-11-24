@@ -1,0 +1,13 @@
+# Direct dependencies of the GraphRAG code (src/), pinned to tested versions.
+# Install: .venv/bin/pip install -r requirements.txt   (Python 3.12)
+# The edgar-crawler's own deps live in data/edgar-software-corpus/edgar-crawler/ (installed unpinned).
+
+# Framework + local embeddings (pulls in torch, transformers, sentence-transformers)
+llama-index-core==0.14.26
+llama-index-embeddings-huggingface==0.9.0
+sentence-transformers==6.3.0
+torch==2.15.0
+
+# LLM backends (Groq uses the OpenAI-compatible API) + config from .env
+openai==3.58.0
+python-dotenv==1.2.4
