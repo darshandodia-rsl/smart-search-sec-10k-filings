@@ -59,7 +59,12 @@ than speed.
 smart-search-sec-10k-filings/      ← project root (run commands from here)
 ├── CLAUDE.md, PLAN.md, README.md
 ├── .venv/                         ← the ONE virtual env (Python 3.12) for everything
-├── src/                           ← all GraphRAG code goes here
+├── pyproject.toml                 ← makes src/sec10k an installable package (pip install -e .)
+├── src/sec10k/                    ← all GraphRAG code: ONE package, run with `python -m sec10k.<module>`
+│   ├── config.py                  ← shared paths/settings; never compute paths from __file__ elsewhere
+│   ├── llm/                       ← LLM backends
+│   ├── ingest/                    ← pipeline: loader, headings, chunker (graph/, retrieval/, api/ later)
+│   └── analysis/                  ← one-off studies; may import the pipeline, never the reverse
 ├── corpus/                        ← scripts + frozen snapshot to rebuild the corpus (in git)
 └── data/                          ← git-ignored
     └── edgar-software-corpus/     ← downloaded corpus + crawler (treat as read-only)

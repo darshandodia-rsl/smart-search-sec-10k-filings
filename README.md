@@ -9,7 +9,7 @@ production team would: resumable, budgeted ingestion and swappable LLM backends.
 ## Stack
 - **Graph + vector store:** Neo4j 5.26 Community (Docker)
 - **Embeddings:** `BAAI/bge-base-en-v1.5`, run locally (Apple Silicon GPU via MPS)
-- **LLM:** swappable backend (`src/llm.py`)
+- **LLM:** swappable backend (`src/sec10k/llm/providers.py`)
   - Groq `openai/gpt-oss-120b` (free tier)
   - Claude via `claude -p` (a workaround for free-tier limits)
 
@@ -19,16 +19,22 @@ Requires Python 3.12, Docker (e.g. OrbStack), and optionally the `claude` CLI.
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -e .     # our code as the editable package `sec10k` (src/sec10k/)
 
 cp .env.example .env          # then fill in NEO4J_PASSWORD and GROQ_API_KEY
 docker compose up -d          # Neo4j browser: http://localhost:7474 (connect to bolt://localhost:7687)
 
-.venv/bin/python src/llm.py   # smoke test: same prompt to both LLM backends
+.venv/bin/python -m sec10k.llm.providers   # smoke test: same prompt to both LLM backends
 ```
 
 ## Layout
 ```
-src/          GraphRAG code
+src/sec10k/   GraphRAG code, one Python package (run modules with: .venv/bin/python -m sec10k.<module>)
+  config.py     shared paths and settings (the only place that knows where files live)
+  llm/          swappable LLM backends
+  ingest/       pipeline: load + clean filings, recover headings, chunk
+  analysis/     one-off studies (corpus profiling, chunking comparison), not part of the pipeline
+pyproject.toml  makes src/sec10k installable; versions stay pinned in requirements.txt
 corpus/       scripts + frozen snapshot to rebuild the corpus (see below)
 data/         corpus + Neo4j data + pipeline state (git-ignored)
 PLAN.md       phases and progress log

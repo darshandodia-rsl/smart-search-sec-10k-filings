@@ -26,14 +26,8 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date
-from pathlib import Path
 
-from dotenv import load_dotenv
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
-
-STATE_DIR = PROJECT_ROOT / "data" / "state"  # git-ignored (under data/)
+from sec10k.config import STATE_DIR  # also loads .env
 
 
 # --------------------------------------------------------------------------------------
@@ -251,7 +245,7 @@ def get_llm(backend: str | None = None) -> LLMProvider:
 
 
 # --------------------------------------------------------------------------------------
-# Smoke test: same prompt to both backends.  Run: .venv/bin/python src/llm.py
+# Smoke test: same prompt to both backends.  Run: .venv/bin/python -m sec10k.llm.providers
 # --------------------------------------------------------------------------------------
 if __name__ == "__main__":
     system = "You answer in one short sentence."

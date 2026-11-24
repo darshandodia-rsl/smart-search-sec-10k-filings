@@ -4,7 +4,7 @@ Step 1.1: section quality checks.
 Step 1.2: real token counts (gpt-oss tokenizer), by section, year and company.
 Step 1.3: year-over-year repetition (how much text is copied from the previous filing).
 Step 1.4: cost estimate (days to finish per LLM backend).
-Run from the project root:  .venv/bin/python src/profile_corpus.py
+Run from the project root:  .venv/bin/python -m sec10k.analysis.profile_corpus
 
 Reads only the filings listed in manifest.csv (the authoritative list) and writes
 detailed results to data/profile/ (git-ignored). The corpus itself is never modified.
@@ -12,15 +12,14 @@ detailed results to data/profile/ (git-ignored). The corpus itself is never modi
 
 import json
 import re
-from pathlib import Path
 
 import pandas as pd
 import tiktoken
 
-ROOT = Path(__file__).resolve().parent.parent
-CORPUS = ROOT / "data" / "edgar-software-corpus"
-OUT = ROOT / "data" / "profile"
-SECTIONS = ["item_1", "item_1A", "item_7", "item_7A"]
+from sec10k.config import CORPUS, SECTIONS, load_manifest
+from sec10k.config import PROFILE_DIR as OUT
+from sec10k.ingest.loader import NUMLINE_RE, PAGE_RE
+
 # gpt-oss-120b's own tokenizer, so counts match what Groq bills against the daily budget.
 # Claude uses a different tokenizer (not available locally); we measure that ratio later.
 ENC = tiktoken.get_encoding("o200k_harmony")
@@ -38,20 +37,8 @@ HTML_RE = re.compile(
     r"</?(?:div|span|p|br|td|tr|th|table|font|b|i|u|a|img|sup|sub|hr)\b[^>]*>|&(?:nbsp|amp|lt|gt|#\d+);",
     re.I,
 )
-# Page furniture the HTML-to-text step left behind: "- 53 -", "29", "Table of Contents",
-# "Apple Inc. | 2020 Form 10-K | 29", "Leidos Holdings, Inc. Annual Report - 55".
-PAGE_RE = re.compile(
-    r"^\s*(?:-?\s*\d{1,3}\s*-?|tables? of contents|.{0,80}(?:form 10-k|annual report).{0,20}\d{1,3})\s*$",
-    re.I,
-)
-# A line that is only numbers/currency/punctuation: a flattened table cell.
-NUMLINE_RE = re.compile(r"^[\s$()%,.\-—–0-9]+$")
 # A later item's heading inside the section suggests the extractor ran past the end.
 NEXT_ITEM_RE = re.compile(r"(?im)^\s*item\s*(?:8|2)\s*[.:\-—–]")
-
-
-def load_manifest() -> pd.DataFrame:
-    return pd.read_csv(CORPUS / "manifest.csv", dtype={"cik": str})
 
 
 def iter_sections(manifest: pd.DataFrame):
@@ -243,7 +230,7 @@ def report_repetition(rep: pd.DataFrame) -> None:
 
 
 # ---- Step 1.4 cost model ------------------------------------------------------------
-# MEASURED (2026-11-24, one 3K-token sample of 10-K text, src/llm.py):
+# MEASURED (2026-11-24, one 3K-token sample of 10-K text, sec10k/llm/providers.py):
 GROQ_TOKEN_RATIO = 1.00      # Groq prompt_tokens / o200k_harmony tokens
 GROQ_CALL_OVERHEAD = 84      # chat-format tokens per call
 CLAUDE_TOKEN_RATIO = 1.62    # Claude Haiku input tokens / o200k_harmony tokens (single sample!)
