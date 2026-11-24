@@ -29,16 +29,33 @@ docker compose up -d          # Neo4j browser: http://localhost:7474 (connect to
 
 ## Layout
 ```
-src/sec10k/   GraphRAG code, one Python package (run modules with: .venv/bin/python -m sec10k.<module>)
-  config.py     shared paths and settings (the only place that knows where files live)
-  llm/          swappable LLM backends
-  ingest/       pipeline: load + clean filings, recover headings, chunk
-  analysis/     one-off studies (corpus profiling, chunking comparison), not part of the pipeline
-pyproject.toml  makes src/sec10k installable; versions stay pinned in requirements.txt
-corpus/       scripts + frozen snapshot to rebuild the corpus (see below)
-data/         corpus + Neo4j data + pipeline state (git-ignored)
-PLAN.md       phases and progress log
-CLAUDE.md     working rules for Claude Code sessions
+src/sec10k/            GraphRAG code, one Python package (run: .venv/bin/python -m sec10k.<module>)
+├── config.py            shared paths and settings (the only place that knows where files live)
+├── llm/
+│   └── providers.py     swappable LLM backends (Groq gpt-oss-120b, Claude via `claude -p`)
+├── ingest/              pipeline
+│   ├── loader.py          load + clean filings, selected via manifest.csv
+│   ├── headings.py        recover section headings
+│   └── chunker.py         split sections into chunks
+└── analysis/            one-off studies, not part of the pipeline
+    ├── profile_corpus.py  corpus profiling
+    └── compare_chunking.py  chunking comparison
+
+corpus/                scripts + frozen snapshot to rebuild the corpus (see below)
+├── step1_candidates.py, step1b_extras.py, step2_select.py   company selection
+├── step3_manifest.py    builds manifest.csv
+├── spot_check.py        by-eye check of extractions
+├── setup_crawler.sh     sets up edgar-crawler (+ throttle patch, config template)
+├── requirements.txt     pinned versions that reproduce the corpus
+└── snapshot/            frozen company list and build outputs
+
+data/                  corpus + Neo4j data + pipeline state (git-ignored)
+docker-compose.yml     Neo4j
+pyproject.toml         makes src/sec10k installable; versions stay pinned in requirements.txt
+requirements.txt       pinned dependencies for the project venv
+.env.example           every setting; copy to .env (git-ignored) for secrets
+PLAN.md                phases and progress log
+CLAUDE.md              working rules for Claude Code sessions
 ```
 
 ## Rebuild the corpus
