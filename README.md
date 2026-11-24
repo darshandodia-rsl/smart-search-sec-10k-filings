@@ -31,12 +31,17 @@ docker compose up -d          # Neo4j browser: http://localhost:7474 (connect to
 ```
 src/sec10k/            GraphRAG code, one Python package (run: .venv/bin/python -m sec10k.<module>)
 ├── config.py            shared paths and settings (the only place that knows where files live)
+├── embeddings.py        local embedding model (bge-base), shared by ingestion and retrieval
 ├── llm/
 │   └── providers.py     swappable LLM backends (Groq gpt-oss-120b, Claude via `claude -p`)
 ├── ingest/              pipeline
 │   ├── loader.py          load + clean filings, selected via manifest.csv
 │   ├── headings.py        recover section headings
-│   └── chunker.py         split sections into chunks
+│   ├── chunker.py         split sections into chunks
+│   └── embed.py           embed chunks into Neo4j + vector index (resumable)
+├── graph/               Neo4j
+│   ├── store.py           connection (LlamaIndex Neo4jPropertyGraphStore)
+│   └── structure.py       structural graph: Company → Filing → Section → Chunk
 └── analysis/            one-off studies, not part of the pipeline
     ├── profile_corpus.py  corpus profiling
     └── compare_chunking.py  chunking comparison

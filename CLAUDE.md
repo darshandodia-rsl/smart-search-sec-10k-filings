@@ -63,7 +63,9 @@ smart-search-sec-10k-filings/      ← project root (run commands from here)
 ├── src/sec10k/                    ← all GraphRAG code: ONE package, run with `python -m sec10k.<module>`
 │   ├── config.py                  ← shared paths/settings; never compute paths from __file__ elsewhere
 │   ├── llm/                       ← LLM backends
-│   ├── ingest/                    ← pipeline: loader, headings, chunker (graph/, retrieval/, api/ later)
+│   ├── embeddings.py              ← the one embedding model (chunker tokenizer must match it)
+│   ├── ingest/                    ← pipeline: loader, headings, chunker, embed
+│   ├── graph/                     ← Neo4j store + graph writers (retrieval/, api/ later)
 │   └── analysis/                  ← one-off studies; may import the pipeline, never the reverse
 ├── corpus/                        ← scripts + frozen snapshot to rebuild the corpus (in git)
 └── data/                          ← git-ignored

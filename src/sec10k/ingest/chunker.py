@@ -29,11 +29,10 @@ import pandas as pd
 from llama_index.core.node_parser import SentenceSplitter
 from transformers import AutoTokenizer
 
-from sec10k.config import load_manifest
+from sec10k.config import EMBED_MODEL, load_manifest
 from sec10k.ingest.headings import load_headings, lookup
 from sec10k.ingest.loader import SECTION_TITLES, Section, iter_clean_sections
 
-EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 MAX_TOKENS = 400          # chunk text; header adds ~20-60, still under bge's 512 limit
 BGE_LIMIT = 512
 MAX_HEADING_WORDS = 30    # long risk titles are cut in the header to keep it short
@@ -68,13 +67,20 @@ class Chunk:
     content_hash: str
 
     def embed_text(self) -> str:
-        """Text sent to the embedding model: a context header + the chunk text."""
-        parts = [f"{self.company} ({self.ticker}) 10-K FY{self.fiscal_year}",
-                 SECTION_TITLES[self.section]]
-        if self.heading and not self.text.startswith(self.heading):
-            words = self.heading.split()
-            parts.append(" ".join(words[:MAX_HEADING_WORDS]) + (" ..." if len(words) > MAX_HEADING_WORDS else ""))
-        return " | ".join(parts) + "\n" + self.text
+        return build_embed_text(self.company, self.ticker, self.fiscal_year, self.section,
+                                self.heading, self.text)
+
+
+def build_embed_text(company: str, ticker: str, fiscal_year: int, section: str,
+                     heading: str | None, text: str) -> str:
+    """Text sent to the embedding model: a context header + the chunk text, e.g.
+    "ORACLE CORP (ORCL) 10-K FY2020 | Item 1A Risk Factors | <heading>\n<text>".
+    The heading is left out when the text already starts with it."""
+    parts = [f"{company} ({ticker}) 10-K FY{fiscal_year}", SECTION_TITLES[section]]
+    if heading and not text.startswith(heading):
+        words = heading.split()
+        parts.append(" ".join(words[:MAX_HEADING_WORDS]) + (" ..." if len(words) > MAX_HEADING_WORDS else ""))
+    return " | ".join(parts) + "\n" + text
 
 
 def chunk_section(sec: Section, headings: dict[str, dict]) -> list[Chunk]:

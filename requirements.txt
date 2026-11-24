@@ -5,6 +5,7 @@
 # Framework + local embeddings (pulls in torch, transformers, sentence-transformers)
 llama-index-core==0.14.26
 llama-index-embeddings-huggingface==0.9.0
+llama-index-graph-stores-neo4j==0.9.0     # Neo4jPropertyGraphStore (pulls in the neo4j driver)
 sentence-transformers==6.3.0
 torch==2.15.0
 
