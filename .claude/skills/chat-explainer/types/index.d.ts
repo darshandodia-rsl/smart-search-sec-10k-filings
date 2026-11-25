@@ -7,6 +7,9 @@ declare module 'claude-code' {
       updatedAt: Shaped<string>
       qa: Shaped<QA[]>
       busy: Shaped<string>
+      model: Shaped<string>
+      showSummary: Shaped<boolean>
+      claudeSession: Shaped<string>
     }
   }
 }
