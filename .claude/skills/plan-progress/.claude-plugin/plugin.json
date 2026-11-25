@@ -1,0 +1,1 @@
+{ "name": "plan-progress", "version": "0.1.0", "description": "Side panel: vertical timeline of PLAN.md phases, current step, open items, git and LLM budget", "types": "./types/index.d.ts" }

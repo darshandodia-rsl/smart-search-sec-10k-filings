@@ -1,18 +1,23 @@
-"""LLM provider interface: one `complete()` call, swappable backends.
+"""One common way to call an LLM, with swappable backends.
 
-The rest of the codebase only talks to `LLMProvider`. Which backend answers is chosen by
-the LLM_BACKEND environment variable (see `get_llm()`), so switching vendors needs no code change.
+What it does: defines `LLMProvider`, a class with a single `complete(prompt)` call, and two
+backends that implement it:
+  - GroqProvider       the "real" production path (openai/gpt-oss-120b over Groq's
+                       OpenAI-compatible API, free tier)
+  - ClaudeCLIProvider  a WORKAROUND for the free tier's small limits: it runs `claude -p`
+                       (Claude Code headless, on the Pro plan)
+Which backend is used is set by the LLM_BACKEND environment variable (see `get_llm()`).
 
-Backends:
-  - GroqProvider       the "real" production path (openai/gpt-oss-120b, OpenAI-compatible API)
-  - ClaudeCLIProvider  WORKAROUND for free-API limits: shells out to `claude -p` (Claude Pro plan)
+Why it is needed: the rest of the project only talks to `LLMProvider`, so it does not depend
+on one vendor, and moving to a different LLM needs no code change outside this file. Entity
+extraction (Phase 3) and answer generation will call the LLM through here.
 
-Guards (minimal Phase 0 version; Phase 4 replaces these with a proper limiter, a token-per-minute
-budget and a response cache):
-  - retries with backoff   -> openai SDK's built-in `max_retries` (Groq only)
-  - request pacing         -> at most N requests/minute, per backend
-  - daily token budget     -> refuses to call once today's tokens would exceed the limit;
-                              persisted to a JSON file so it survives restarts
+Built-in guards (a simple version; a fuller rate limiter and a response cache are planned
+for the production ingestion pipeline):
+  - retries with waiting  -> the openai SDK's built-in `max_retries` (Groq only)
+  - request pacing        -> at most N requests per minute, per backend
+  - daily token budget    -> refuses to call once today's tokens would pass the limit; the
+                             count is saved to a JSON file so it survives restarts
 """
 
 from __future__ import annotations
@@ -31,10 +36,12 @@ from sec10k.config import STATE_DIR  # also loads .env
 
 
 # --------------------------------------------------------------------------------------
-# Result type: every backend returns the same shape
+# Result type: every backend returns the same shape, so callers never care which one answered
 # --------------------------------------------------------------------------------------
 @dataclass
 class LLMResponse:
+    """The answer of one LLM call: the text, the tokens used, and which model/backend gave it."""
+
     text: str
     input_tokens: int
     output_tokens: int
@@ -43,6 +50,7 @@ class LLMResponse:
 
     @property
     def total_tokens(self) -> int:
+        """Input plus output tokens; this is what counts against the daily budget."""
         return self.input_tokens + self.output_tokens
 
 
@@ -51,10 +59,14 @@ class BudgetExceeded(RuntimeError):
 
 
 # --------------------------------------------------------------------------------------
-# Minimal guards (Phase 0). Phase 4 replaces these.
+# Guards: a simple daily token budget and request pacing
 # --------------------------------------------------------------------------------------
 class DailyTokenBudget:
-    """Counts tokens used per backend per day in a small JSON file."""
+    """Keeps count of the tokens used today by one backend, and blocks calls past the daily limit.
+
+    The count is saved in a small JSON file, so it survives restarts. This protects the free
+    daily quota: a crash or a rerun can never use up more tokens than allowed.
+    """
 
     def __init__(self, backend: str, daily_limit: int):
         self.backend = backend
@@ -62,6 +74,7 @@ class DailyTokenBudget:
         self.path = STATE_DIR / f"budget_{backend}.json"
 
     def _load(self) -> dict:
+        """Read today's counters from the file; start from zero on a new day or a missing file."""
         if self.path.exists():
             data = json.loads(self.path.read_text())
             if data.get("date") == date.today().isoformat():
@@ -69,9 +82,11 @@ class DailyTokenBudget:
         return {"date": date.today().isoformat(), "tokens_used": 0, "requests": 0}
 
     def used_today(self) -> int:
+        """Return how many tokens this backend has used today."""
         return self._load()["tokens_used"]
 
     def check(self, estimated_tokens: int) -> None:
+        """Raise `BudgetExceeded` if a call of about `estimated_tokens` would pass the daily limit."""
         used = self.used_today()
         if used + estimated_tokens > self.daily_limit:
             raise BudgetExceeded(
@@ -80,17 +95,21 @@ class DailyTokenBudget:
             )
 
     def record(self, tokens: int) -> None:
+        """Add the tokens of a finished call to today's count and save it."""
         data = self._load()
         data["tokens_used"] += tokens
         data["requests"] += 1
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data))
-        tmp.replace(self.path)  # atomic: a crash never leaves a half-written file
+        tmp.replace(self.path)  # the replace is atomic, so the file is never half-written
 
 
 class RequestPacer:
-    """Spaces requests so we never exceed `per_minute` requests per minute."""
+    """Spaces out requests so a backend never gets more than `per_minute` requests a minute.
+
+    The free API rejects requests above its per-minute limit, so we wait before sending.
+    """
 
     def __init__(self, per_minute: int):
         self.min_interval = 60.0 / per_minute
@@ -98,6 +117,7 @@ class RequestPacer:
         self._lock = threading.Lock()
 
     def wait(self) -> None:
+        """Sleep just long enough to keep the minimum gap since the previous request."""
         with self._lock:
             delay = self._last + self.min_interval - time.monotonic()
             if delay > 0:
@@ -106,13 +126,20 @@ class RequestPacer:
 
 
 def _estimate_tokens(text: str) -> int:
-    return len(text) // 4  # rough rule of thumb: ~4 characters per token in English
+    """Roughly estimate the tokens in a text, to check the budget before a call is made."""
+    return len(text) // 4  # about 4 characters per token in English
 
 
 # --------------------------------------------------------------------------------------
 # The interface
 # --------------------------------------------------------------------------------------
 class LLMProvider(ABC):
+    """The common interface of all LLM backends: one `complete()` call.
+
+    The rest of the project only talks to this class, so the vendor can be swapped without
+    changing other code. The guards (budget, pacing) live here so every backend gets them.
+    """
+
     backend: str
 
     def __init__(self, model: str, daily_token_limit: int, requests_per_minute: int):
@@ -121,7 +148,11 @@ class LLMProvider(ABC):
         self.pacer = RequestPacer(requests_per_minute)
 
     def complete(self, prompt: str, system: str | None = None, max_tokens: int = 1024) -> LLMResponse:
-        """Send one prompt, get one answer. Guards run here, so every backend gets them."""
+        """Send one prompt and return the answer.
+
+        Checks the daily budget, waits for the pacer, calls the backend, then records the
+        tokens used. `max_tokens` caps the length of the answer.
+        """
         estimate = _estimate_tokens(prompt + (system or "")) + max_tokens
         self.budget.check(estimate)
         self.pacer.wait()
@@ -130,16 +161,24 @@ class LLMProvider(ABC):
         return resp
 
     @abstractmethod
-    def _complete(self, prompt: str, system: str | None, max_tokens: int) -> LLMResponse: ...
+    def _complete(self, prompt: str, system: str | None, max_tokens: int) -> LLMResponse:
+        """Backend-specific call: send the prompt to the actual LLM and return an `LLMResponse`."""
 
 
 # --------------------------------------------------------------------------------------
-# Backend A: Groq (production path)
+# Backend A: Groq (the production path)
 # --------------------------------------------------------------------------------------
 class GroqProvider(LLMProvider):
+    """Calls openai/gpt-oss-120b on Groq through its OpenAI-compatible API (free tier).
+
+    Limits come from environment variables and default to the free tier's: 30 requests a
+    minute and 200K tokens a day.
+    """
+
     backend = "groq"
 
     def __init__(self):
+        """Read the settings from the environment and create the API client."""
         from openai import OpenAI
 
         super().__init__(
@@ -150,21 +189,22 @@ class GroqProvider(LLMProvider):
         self.client = OpenAI(
             api_key=os.environ["GROQ_API_KEY"],
             base_url="https://api.groq.com/openai/v1",
-            max_retries=5,  # SDK retries 429/5xx with exponential backoff (honours Retry-After)
+            max_retries=5,  # the SDK retries rate-limit and server errors, waiting longer each time
             timeout=120,
         )
-        # gpt-oss is a reasoning model: it "thinks" before answering, and those thinking tokens
-        # count against our budget. "low" keeps that overhead small.
+        # gpt-oss is a reasoning model: it "thinks" before answering, and those thinking
+        # tokens count against the budget. "low" keeps that cost small.
         self.reasoning_effort = os.getenv("GROQ_REASONING_EFFORT", "low")
 
     def _complete(self, prompt, system, max_tokens):
+        """Send the prompt to Groq and wrap the answer and token counts in an `LLMResponse`."""
         messages = ([{"role": "system", "content": system}] if system else []) + [
             {"role": "user", "content": prompt}
         ]
         r = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
-            max_completion_tokens=max_tokens,  # includes reasoning tokens
+            max_completion_tokens=max_tokens,  # this limit includes the thinking tokens
             reasoning_effort=self.reasoning_effort,
         )
         return LLMResponse(
@@ -177,34 +217,45 @@ class GroqProvider(LLMProvider):
 
 
 # --------------------------------------------------------------------------------------
-# Backend B: Claude via `claude -p`  —  WORKAROUND, not a production integration.
-# We use it because the free Groq tier (200K tokens/day) is too small for the full corpus.
-# A real deployment would call the Anthropic API with an API key instead.
+# Backend B: Claude via `claude -p`  --  a WORKAROUND, not a production integration.
+# It adds capacity on top of the free Groq tier (200K tokens/day), which is too small for the
+# full corpus. A real deployment would call the Anthropic API with an API key instead.
 # --------------------------------------------------------------------------------------
 class ClaudeCLIProvider(LLMProvider):
+    """WORKAROUND backend: runs Claude Code in headless mode (`claude -p`) on the Pro plan.
+
+    It starts a `claude` process for each call and reads the answer and token usage from
+    its JSON output. It is trimmed to the minimum (no tools, no project instructions) so
+    each call costs few tokens.
+    """
+
     backend = "claude_cli"
 
     def __init__(self):
+        """Read the settings from the environment (model, daily cap, requests per minute)."""
         super().__init__(
             model=os.getenv("CLAUDE_MODEL", "haiku"),
-            # Pro-plan limits are per 5-hour window and not published as token numbers;
-            # this is our own self-imposed daily cap, tune it once we see real usage.
+            # Pro-plan limits are per 5-hour window and are not published as token numbers,
+            # so this daily cap is our own choice, to be tuned from real usage.
             daily_token_limit=int(os.getenv("CLAUDE_DAILY_TOKENS", "2000000")),
             requests_per_minute=int(os.getenv("CLAUDE_RPM", "10")),
         )
 
     def _complete(self, prompt, system, max_tokens):
-        # max_tokens: `claude -p` has no output-length flag, so it is only used for budgeting.
+        """Run `claude -p` with the prompt and wrap the answer and token counts in an `LLMResponse`.
+
+        `claude -p` has no output-length option, so `max_tokens` only affects the budget check.
+        """
         cmd = [
             "claude", "-p",
             "--model", self.model,
-            "--output-format", "json",                         # gives us token usage
-            "--system-prompt", system or "You are a helpful assistant.",  # replace CC's big prompt
-            "--tools", "",                                     # no tools -> no tool definitions sent
+            "--output-format", "json",                         # includes the token usage
+            "--system-prompt", system or "You are a helpful assistant.",  # replaces Claude Code's long default prompt
+            "--tools", "",                                     # no tools, so no tool definitions are sent
             "--strict-mcp-config",                             # no MCP servers
-            "--no-session-persistence",                        # don't save a session per call
+            "--no-session-persistence",                        # do not save a session for each call
         ]
-        # Run from an empty temp dir so no project CLAUDE.md gets loaded into the context.
+        # Run from an empty temporary folder so no project CLAUDE.md is loaded into the prompt.
         with tempfile.TemporaryDirectory() as cwd:
             proc = subprocess.run(
                 cmd, input=prompt, capture_output=True, text=True, cwd=cwd, timeout=300
@@ -231,13 +282,18 @@ class ClaudeCLIProvider(LLMProvider):
 
 
 # --------------------------------------------------------------------------------------
-# Factory
+# Factory: picks the backend
 # --------------------------------------------------------------------------------------
+# The available backends by name, for `get_llm()` and the smoke test.
 _BACKENDS = {"groq": GroqProvider, "claude_cli": ClaudeCLIProvider}
 
 
 def get_llm(backend: str | None = None) -> LLMProvider:
-    """Return the configured backend (LLM_BACKEND env var, default 'groq')."""
+    """Return the backend named by `backend` or, if not given, by the LLM_BACKEND environment variable (default "groq").
+
+    Other modules call this instead of creating a provider themselves, so the backend can be
+    switched in `.env` without touching code.
+    """
     name = backend or os.getenv("LLM_BACKEND", "groq")
     if name not in _BACKENDS:
         raise ValueError(f"Unknown LLM_BACKEND {name!r}; choose from {list(_BACKENDS)}")
@@ -245,7 +301,7 @@ def get_llm(backend: str | None = None) -> LLMProvider:
 
 
 # --------------------------------------------------------------------------------------
-# Smoke test: same prompt to both backends.  Run: .venv/bin/python -m sec10k.llm.providers
+# Smoke test: sends the same prompt to both backends.  Run: .venv/bin/python -m sec10k.llm.providers
 # --------------------------------------------------------------------------------------
 if __name__ == "__main__":
     system = "You answer in one short sentence."

@@ -1,14 +1,20 @@
-"""Phase 2.2 experiment: paragraph-aware vs semantic chunking, side by side.
+"""Experiment script: compares two ways of chunking, side by side.
 
-Same filings, two LlamaIndex splitters:
-  - paragraph: SentenceSplitter packs whole paragraphs (one per line) up to ~400 bge tokens;
-               only paragraphs longer than that get split, at sentence breaks. No overlap.
-  - semantic:  SemanticSplitterNodeParser embeds every sentence (with 1 neighbour each side)
-               and starts a new chunk where similarity to the next sentence drops below the
-               section's 95th-percentile distance (LlamaIndex default).
-Measures: chunk count and size (bge tokens), chunks over bge's 512-token limit (silently
-truncated when embedded), tiny chunks, run time, and year-over-year stability (share of
-FY2023 chunks whose exact text also appears as a FY2022 chunk = work we could skip).
+What it does: chunks the same sample filings (Microsoft FY2022 and FY2023, Salesforce FY2023)
+with two LlamaIndex splitters and prints statistics for each:
+  - paragraph: `SentenceSplitter` packs whole paragraphs (one per line) into chunks of up to
+               about 400 tokens. Only a paragraph longer than that is split, at sentence ends.
+               No overlap between chunks.
+  - semantic:  `SemanticSplitterNodeParser` embeds every sentence (together with one
+               neighbour on each side) and starts a new chunk where the meaning changes
+               sharply (the distance to the next sentence passes the 95th percentile).
+The statistics are: number and size of chunks, chunks over the embedding model's 512-token
+limit (the text past the limit is silently cut off when embedded), tiny chunks, run time,
+and how many FY2023 chunks appear word for word in FY2022 (text that never changed).
+
+Why it is needed: it shows the trade-offs of each chunking method on real filings, which is
+the evidence behind the choice made in `sec10k/ingest/chunker.py`. It is a one-off study
+and is not part of the pipeline.
 
 Run from the project root:  .venv/bin/python -m sec10k.analysis.compare_chunking
 """
@@ -22,15 +28,19 @@ from transformers import AutoTokenizer
 
 from sec10k.ingest.loader import iter_clean_sections
 
-MODEL = "BAAI/bge-base-en-v1.5"
+MODEL = "BAAI/bge-base-en-v1.5"    # the embedding model; its tokenizer measures chunk sizes
+# The sample filings to chunk: Microsoft FY2022 and FY2023, Salesforce FY2023.
 FILINGS = {("MSFT", 2022), ("MSFT", 2023), ("CRM", 2023)}
-CHUNK_TOKENS = 400
-BGE_LIMIT = 512
+CHUNK_TOKENS = 400    # target chunk size in tokens
+BGE_LIMIT = 512      # the embedding model's input limit; text past it is cut off
 
 tok = AutoTokenizer.from_pretrained(MODEL)
+# Counts the embedding-model tokens in a text.
 n_tokens = lambda s: len(tok.encode(s, add_special_tokens=False))  # noqa: E731
 
+# The embedding model the semantic splitter uses to compare neighbouring sentences.
 embed = HuggingFaceEmbedding(model_name=MODEL, device="mps")
+# The two chunking methods under comparison.
 splitters = {
     "paragraph": SentenceSplitter(chunk_size=CHUNK_TOKENS, chunk_overlap=0, paragraph_separator="\n",
                                   tokenizer=lambda s: tok.encode(s, add_special_tokens=False)),
@@ -38,9 +48,11 @@ splitters = {
                                            breakpoint_percentile_threshold=95),
 }
 
+# The cleaned sections of the sample filings.
 sections = [s for s in iter_clean_sections(["MSFT", "CRM"]) if (s.ticker, s.fiscal_year) in FILINGS]
 print(f"{len(sections)} sections, {sum(n_tokens(s.text) for s in sections):,} bge tokens\n")
 
+# Chunk the sample with each method and print its statistics.
 results = {}
 for name, splitter in splitters.items():
     t0 = time.time()
@@ -51,7 +63,7 @@ for name, splitter in splitters.items():
     secs = time.time() - t0
     sizes = sorted(n_tokens(c) for cs in chunks.values() for c in cs)
     n = len(sizes)
-    # Stability: MSFT FY2023 chunks that exist verbatim among MSFT FY2022 chunks (same section).
+    # Stability: how many MSFT FY2023 chunks appear word for word among the FY2022 chunks of the same section.
     same = total = 0
     for (t, y, sec), cs in chunks.items():
         if (t, y) == ("MSFT", 2023):
@@ -66,7 +78,7 @@ for name, splitter in splitters.items():
     print(f"   < 50 tokens (tiny): {sum(x < 50 for x in sizes)}")
     print(f"   MSFT FY2023 chunks identical to a FY2022 chunk: {same}/{total} ({same / total:.0%})\n")
 
-# Show where each method puts its first few boundaries in MSFT FY2023 Risk Factors.
+# Show where each method puts its first few chunk boundaries in MSFT FY2023 Risk Factors.
 key = ("MSFT", 2023, "item_1A")
 for name, chunks in results.items():
     print(f"--- {name}: first 6 chunks of MSFT FY2023 Item 1A (start ... end, tokens) ---")

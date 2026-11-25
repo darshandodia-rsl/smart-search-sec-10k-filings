@@ -1,13 +1,21 @@
-"""Phase 1: profile the 10-K corpus before designing anything.
+"""Profiles the 10-K corpus: quality, size, year-over-year repetition and LLM cost.
 
-Step 1.1: section quality checks.
-Step 1.2: real token counts (gpt-oss tokenizer), by section, year and company.
-Step 1.3: year-over-year repetition (how much text is copied from the previous filing).
-Step 1.4: cost estimate (days to finish per LLM backend).
+What it does: runs four checks over all filings listed in the manifest and prints a report
+(detailed tables go to data/profile/, which is not in git):
+  1. Section quality: empty, heading-only, much too short or long, HTML leftovers, page
+     artifacts, flattened tables.
+  2. Real token counts (with the gpt-oss tokenizer) by section, year and company.
+  3. Year-over-year repetition: how much of each section is copied from the same company's
+     previous filing.
+  4. Cost estimate: how many days the LLM work would take on each backend.
+The corpus files are only read, never changed.
+
+Why it is needed: it gives the numbers that drive the design. The quality check says what
+the loader must clean, the token counts size the work, and the repetition and cost numbers
+show how much LLM budget skipping unchanged text and pre-filtering chunks can save.
+It is a one-off study and is not part of the pipeline.
+
 Run from the project root:  .venv/bin/python -m sec10k.analysis.profile_corpus
-
-Reads only the filings listed in manifest.csv (the authoritative list) and writes
-detailed results to data/profile/ (git-ignored). The corpus itself is never modified.
 """
 
 import json
@@ -20,24 +28,25 @@ from sec10k.config import CORPUS, SECTIONS, load_manifest
 from sec10k.config import PROFILE_DIR as OUT
 from sec10k.ingest.loader import NUMLINE_RE, PAGE_RE
 
-# gpt-oss-120b's own tokenizer, so counts match what Groq bills against the daily budget.
-# Claude uses a different tokenizer (not available locally); we measure that ratio later.
+# gpt-oss-120b's own tokenizer, so counts match what Groq counts against the daily budget.
+# Claude uses a different tokenizer that is not available locally; its ratio to this one is
+# set below as CLAUDE_TOKEN_RATIO.
 ENC = tiktoken.get_encoding("o200k_harmony")
 
-# Expected opening heading per section, e.g. "Item 1A. Risk Factors" / "ITEM 1A -".
+# Pattern for the heading each section should open with, e.g. "Item 1A. Risk Factors" or "ITEM 1A -".
 HEADING = {
     "item_1": r"item\s*1\b(?!\s*a)",
     "item_1A": r"item\s*1a\b",
     "item_7": r"item\s*7\b(?!\s*a)",
     "item_7A": r"item\s*7a\b",
 }
-# Real HTML leftovers only. A generic "<...>" pattern also matches product text such as
-# "<Dial>, <Record>" (seen in Twilio filings), so we list actual tag names.
+# Matches real HTML leftovers (listed tag names and entities). A generic "<...>" pattern
+# would also match product text like "<Dial>, <Record>".
 HTML_RE = re.compile(
     r"</?(?:div|span|p|br|td|tr|th|table|font|b|i|u|a|img|sup|sub|hr)\b[^>]*>|&(?:nbsp|amp|lt|gt|#\d+);",
     re.I,
 )
-# A later item's heading inside the section suggests the extractor ran past the end.
+# Matches the heading of a later item (Item 2 or 8); finding one inside a section means the section runs past its end.
 NEXT_ITEM_RE = re.compile(r"(?im)^\s*item\s*(?:8|2)\s*[.:\-—–]")
 
 
@@ -50,6 +59,10 @@ def iter_sections(manifest: pd.DataFrame):
 
 
 def section_metrics(sec: str, text: str) -> dict:
+    """Measure one section: size, opening heading, HTML leftovers, page artifacts, number-only lines, and more.
+
+    These raw measurements feed the quality flags in `add_flags`.
+    """
     lines = [ln for ln in text.split("\n") if ln.strip()]
     n_lines = len(lines) or 1
     return {
@@ -65,8 +78,11 @@ def section_metrics(sec: str, text: str) -> dict:
 
 
 def add_flags(df: pd.DataFrame) -> pd.DataFrame:
-    # Compare each section with the same company's other years: 10-K sections are fairly
-    # stable per company, so a big jump either way usually means an extraction error.
+    """Add a True/False flag column per quality problem (empty, much shorter or longer than usual, and so on).
+
+    A section is compared with the same company's other years. A company's sections stay
+    similar in size, so a big jump either way usually means an extraction error.
+    """
     med = df.groupby(["cik", "section"])["words"].transform("median")
     df["ratio_to_company_median"] = (df["words"] / med).round(2)
 
@@ -86,6 +102,7 @@ def add_flags(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def report_quality(df: pd.DataFrame) -> None:
+    """Print section sizes, how many sections each flag marks, and the likely extraction errors."""
     flag_cols = [c for c in df.columns if c.startswith("flag_")]
     print("Words per section:")
     print(df.groupby("section")["words"].describe(percentiles=[0.05, 0.5, 0.95]).round(0).astype(int), "\n")
@@ -103,6 +120,10 @@ def report_quality(df: pd.DataFrame) -> None:
 
 
 def report_tokens(df: pd.DataFrame, manifest: pd.DataFrame) -> None:
+    """Print token counts by section, filing, year and company, and save two CSV summaries.
+
+    Token counts show how much text there is, which sets the cost of any LLM work.
+    """
     m = 1e6
     total = df["tokens"].sum()
     est = manifest["est_tokens_all"].sum()
@@ -138,41 +159,51 @@ def report_tokens(df: pd.DataFrame, manifest: pd.DataFrame) -> None:
 
 
 def paragraphs(text: str) -> list[str]:
-    """Split a section into paragraphs (one per line), dropping page furniture and
-    number-only table lines: both are noise and would hide real repetition."""
+    """Split a section into paragraphs (one per line), dropping page furniture and number-only table lines.
+
+    Both are noise that would hide real repetition between years.
+    """
     return [ln.strip() for ln in text.split("\n")
             if ln.strip() and not PAGE_RE.match(ln) and not NUMLINE_RE.match(ln.strip())]
 
 
 def norm(par: str, mask_numbers: bool) -> str:
-    """Normalize so cosmetic differences don't count as changes."""
+    """Normalize a paragraph (case, quotes, dashes, spaces) so cosmetic differences do not count as changes.
+
+    With `mask_numbers`, every number becomes "#", so "fiscal 2023" equals "fiscal 2024".
+    """
     p = par.lower().replace("’", "'").replace("“", '"').replace("”", '"')
     p = re.sub(r"[–—]", "-", p)
     p = re.sub(r"\s+", " ", p)
-    if mask_numbers:  # "fiscal 2023" == "fiscal 2024"; "$5.1 billion" == "$6.3 billion"
+    if mask_numbers:
         p = re.sub(r"\d[\d,.]*", "#", p)
     return p
 
 
-# Sentence boundary: end punctuation, whitespace, then something that starts a sentence.
+# Matches a sentence boundary: end punctuation, a space, then something that starts a sentence.
 SENT_SPLIT_RE = re.compile(r"(?<=[.;!?])\s+(?=[A-Z\"“(•])")
-# Two match units x two normalizations. Paragraph matching shows what we'd skip if we
-# compare whole paragraphs; sentence matching shows how much text is *really* reused
-# (a paragraph with one edited sentence counts as fully new at the paragraph level).
+# The four ways of comparing with the previous year: two units (paragraph, sentence) times
+# two normalizations (numbers kept, numbers masked). Paragraph matching shows what we could
+# skip by comparing whole paragraphs. Sentence matching shows how much text is really reused,
+# because a paragraph with one edited sentence counts as fully new at the paragraph level.
 VARIANTS = {"para_exact": ("para", False), "para_masked": ("para", True),
             "sent_exact": ("sent", False), "sent_masked": ("sent", True)}
 
 
 def units(text: str) -> dict[str, list[str]]:
+    """Split a section into its paragraphs and its sentences, the two units we compare."""
     pars = paragraphs(text)
     return {"para": pars, "sent": [x for p in pars for x in SENT_SPLIT_RE.split(p) if x.strip()]}
 
 
 def repetition_table(manifest: pd.DataFrame) -> pd.DataFrame:
-    """For each filing-section: tokens in units (paragraphs or sentences) already present
-    (same company, same section) in that company's previous filing in the manifest."""
+    """For each section of each filing, count the tokens already present in the previous year.
+
+    "Present" means the same paragraph or sentence appears in the same section of the same
+    company's previous filing. The result shows how much text an LLM would not need to read again.
+    """
     rows = []
-    prev: dict[tuple, dict[str, set]] = {}  # (cik, section) -> {variant: set of normalized units}
+    prev: dict[tuple, dict[str, set]] = {}  # (company, section) -> {comparison variant: set of normalized units}
     ordered = manifest.sort_values(["cik", "fiscal_year"])
     for row, sec, text in iter_sections(ordered):
         u = units(text)
@@ -192,6 +223,10 @@ def repetition_table(manifest: pd.DataFrame) -> pd.DataFrame:
 
 
 def report_repetition(rep: pd.DataFrame) -> None:
+    """Print how much text repeats from the previous filing, by section, year and company.
+
+    Also prints how many tokens the LLM would have to read once, and saves the table as a CSV.
+    """
     m = 1e6
     rep_cols = [f"rep_{v}" for v in VARIANTS]
     print("=" * 70, "\nYEAR-OVER-YEAR REPETITION (same company + section vs previous filing)\n")
@@ -213,12 +248,12 @@ def report_repetition(rep: pd.DataFrame) -> None:
     print("By fiscal year (share repeated):")
     print(shares(by_year).T.to_string(), "\n")
 
-    # Spread across companies: is repetition typical or driven by a few heavy copiers?
+    # The spread across companies shows whether repetition is typical or driven by a few companies.
     by_co = later.groupby("ticker")[["tokens"] + rep_cols].sum()
     print("Per company (spread of share repeated):")
     print(shares(by_co).describe(percentiles=[0.1, 0.5, 0.9]).round(2).loc[["min", "10%", "50%", "90%", "max"]], "\n")
 
-    # What the LLM would have to read: first filings in full + only the new units after.
+    # What the LLM would have to read: each company's first filing in full, then only the new text.
     print("Tokens the LLM must read once (first filing in full + only new text after):")
     for var in VARIANTS:
         need = total - rep[f"rep_{var}"].sum()
@@ -229,26 +264,29 @@ def report_repetition(rep: pd.DataFrame) -> None:
     rep.to_csv(OUT / "repetition_by_section.csv", index=False)
 
 
-# ---- Step 1.4 cost model ------------------------------------------------------------
-# MEASURED (2026-11-24, one 3K-token sample of 10-K text, sec10k/llm/providers.py):
-GROQ_TOKEN_RATIO = 1.00      # Groq prompt_tokens / o200k_harmony tokens
-GROQ_CALL_OVERHEAD = 84      # chat-format tokens per call
-CLAUDE_TOKEN_RATIO = 1.62    # Claude Haiku input tokens / o200k_harmony tokens (single sample!)
-CLAUDE_CALL_OVERHEAD = 621   # fixed `claude -p` input tokens per call (with our minimal flags)
-# ASSUMED (to be replaced with real numbers in Phase 3):
-CONTENT_PER_CALL = 4_000     # o200k tokens of filing text per request (fits Groq's 8K tokens/min)
+# ---- Cost model: how many days the LLM work would take ---------------------------------
+# MEASURED on one 3K-token sample of 10-K text through sec10k/llm/providers.py (2026-11-24):
+GROQ_TOKEN_RATIO = 1.00      # Groq prompt tokens divided by o200k_harmony tokens
+GROQ_CALL_OVERHEAD = 84      # fixed chat-format tokens added to every call
+CLAUDE_TOKEN_RATIO = 1.62    # Claude Haiku input tokens divided by o200k_harmony tokens (from a single sample)
+CLAUDE_CALL_OVERHEAD = 621   # fixed input tokens of every `claude -p` call, with our minimal flags
+# ASSUMED values, to be replaced by measurements from the extraction prototype:
+CONTENT_PER_CALL = 4_000     # tokens of filing text per request (fits Groq's 8K tokens/minute limit)
 PROMPT_TOKENS = 1_000        # extraction instructions + schema per request
-OUTPUT_SHARE = 0.25          # output tokens as a share of content tokens (JSON triples)
-GROQ_REASONING = 300         # gpt-oss "thinking" tokens per call at reasoning_effort=low
-# BUDGETS (tokens/day): Groq free tier; Claude = our self-imposed cap (Pro limits are not
-# published as token numbers, so the real figure must be measured in Phase 4).
+OUTPUT_SHARE = 0.25          # output tokens as a share of the content tokens (the extracted triples)
+GROQ_REASONING = 300         # gpt-oss "thinking" tokens per call at low reasoning effort
+# DAILY BUDGETS in tokens: the Groq free tier, and for Claude our own cap (the Pro plan's
+# limits are not published as token numbers, so the real figure has to be measured).
 GROQ_DAILY = 200_000
 CLAUDE_DAILY = 2_000_000
 
 
 def content_per_day() -> dict[str, float]:
-    """How many o200k tokens of *filing text* each backend gets through per day, once
-    prompt, output and per-call overhead are paid for."""
+    """Return how many tokens of filing text each backend can get through per day.
+
+    Each call also spends tokens on the prompt, the output and fixed overhead, so only part
+    of the daily budget is filing text. The result is the basis of the days-to-finish estimate.
+    """
     groq_call = (GROQ_CALL_OVERHEAD + (PROMPT_TOKENS + CONTENT_PER_CALL) * GROQ_TOKEN_RATIO
                  + OUTPUT_SHARE * CONTENT_PER_CALL * GROQ_TOKEN_RATIO + GROQ_REASONING)
     claude_call = (CLAUDE_CALL_OVERHEAD + (PROMPT_TOKENS + CONTENT_PER_CALL) * CLAUDE_TOKEN_RATIO
@@ -261,9 +299,10 @@ def content_per_day() -> dict[str, float]:
 
 
 def report_cost_estimate(rep: pd.DataFrame) -> None:
+    """Print how many days the LLM extraction would take under different skipping and filtering choices."""
     m = 1e6
     total = rep["tokens"].sum()
-    to_read = {  # o200k tokens of filing text the LLM must see once
+    to_read = {  # tokens of filing text the LLM must read once, per skipping strategy
         "no skipping": total,
         "skip unchanged paragraphs": total - rep["rep_para_exact"].sum(),
         "skip unchanged sentences": total - rep["rep_sent_exact"].sum(),
@@ -278,16 +317,17 @@ def report_cost_estimate(rep: pd.DataFrame) -> None:
 
     rows = []
     for name, tokens in to_read.items():
-        for keep in (1.0, 0.5, 0.3):  # share of chunks that pass the Phase 3 tier-2/3 filter
+        for keep in (1.0, 0.5, 0.3):  # share of chunks the cheap pre-filter passes on to the LLM
             t = tokens * keep
             rows.append({"skipping": name, "filter_keeps": f"{keep:.0%}", "text_M": round(t / m, 1),
                          "groq_days": round(t / speed["groq"]), "claude_days": round(t / speed["claude"]),
                          "both_days": round(t / both)})
     print(pd.DataFrame(rows).to_string(index=False))
-    print("\nfilter_keeps = share of chunks the Phase 3 pattern/NLP filter sends to the LLM (unknown yet)")
+    print("\nfilter_keeps = share of chunks the pattern/NLP pre-filter sends to the LLM (not measured yet)")
 
 
 def main() -> None:
+    """Run all four profiling steps in order and write the detailed results to data/profile/."""
     manifest = load_manifest()
     rows = []
     for row, sec, text in iter_sections(manifest):

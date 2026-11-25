@@ -1,15 +1,21 @@
-"""Phase 2.1: load filings from the manifest and clean each section.
+"""Loads the filings listed in the manifest and cleans each section's text.
 
-Fixes found in Phase 1 (the corpus on disk stays read-only; we clean in memory):
-  1. Drop a leading table of contents (PD 2019-23 Item 1 starts with one).
-  2. Trim a section where a *later* item starts (DBX 2022 Item 1A ran on through Item 16)
-     or where the financial statements start (ALRM 2015 Item 7A ran into Item 8 unlabeled).
+What it does: reads each filing's sections from the corpus and cleans them in memory
+(the corpus files on disk are never changed). The cleaning steps are:
+  1. Drop a table of contents at the top of a section.
+  2. Cut a section where it runs past its end, i.e. where a later item starts or where
+     the financial statements start.
   3. Drop page furniture ("- 53 -", "Table of Contents", "Apple Inc. | 2020 Form 10-K | 29",
-     running headers "PART I" / "Item 1A" / the company name, "_____" separators,
-     Oracle's per-page "Index to Financial Statements") and rejoin sentences a page break split.
-  4. Drop number-only lines (flattened table cells: "$", "140,936"). They carry no meaning
-     once the table layout is gone, and would only add noise to chunks and embeddings.
-  5. Skip sections with almost no text left (EVTC 2023 Item 1 is a heading only).
+     running headers like "PART I", "_____" separators, repeated company names) and rejoin
+     sentences that a page break split in two.
+  4. Drop lines that are only numbers (flattened table cells such as "$" and "140,936").
+     Without the table layout they carry no meaning and would only add noise.
+  5. Skip sections that have almost no text left (a heading with nothing under it).
+
+Why it is needed: the text extracted from the filings contains leftovers from the original
+pages. If they stayed in, they would end up in chunks and embeddings, making search worse
+and wasting LLM tokens during extraction. This module is the first stage of ingestion: the
+chunker reads its sections from here.
 
 Run from the project root:  .venv/bin/python -m sec10k.ingest.loader   (prints a cleaning report)
 """
@@ -23,35 +29,44 @@ import pandas as pd
 
 from sec10k.config import CORPUS, SECTIONS, load_manifest
 
-# Page furniture the HTML-to-text step left behind: "- 53 -", "29", "Table of Contents",
-# "Apple Inc. | 2020 Form 10-K | 29", "Leidos Holdings, Inc. Annual Report - 55".
+# Matches page furniture that the HTML-to-text step left in the text, such as "- 53 -", "29",
+# "Table of Contents", "Apple Inc. | 2020 Form 10-K | 29", "Leidos Holdings, Inc. Annual Report - 55".
 PAGE_RE = re.compile(
     r"^\s*(?:-?\s*\d{1,3}\s*-?|tables? of contents|.{0,80}(?:form 10-k|annual report).{0,20}\d{1,3})\s*$",
     re.I,
 )
-# A line that is only numbers/currency/punctuation: a flattened table cell.
+# Matches a line made only of numbers, currency signs and punctuation (a flattened table cell).
 NUMLINE_RE = re.compile(r"^[\s$()%,.\-—–0-9]+$")
 
+# Readable name of each section, used in embedding headers and graph nodes.
 SECTION_TITLES = {
     "item_1": "Item 1 Business",
     "item_1A": "Item 1A Risk Factors",
     "item_7": "Item 7 MD&A",
     "item_7A": "Item 7A Market Risk",
 }
-# Order of 10-K items, used to decide whether a heading belongs to a *later* item.
+# The order of items in a 10-K, used to tell whether a heading belongs to a later item.
 ITEM_ORDER = ["1", "1a", "1b", "1c", "2", "3", "4", "5", "6", "7", "7a", "8",
               "9", "9a", "9b", "9c", "10", "11", "12", "13", "14", "15", "16"]
+# The item number each of our sections corresponds to.
 OWN_ITEM = {"item_1": "1", "item_1A": "1a", "item_7": "7", "item_7A": "7a"}
 
-# An item heading line: "ITEM 2. PROPERTIES", "Item 1B.", "Item IA." (roman I for 1).
+# Matches an item heading line such as "ITEM 2. PROPERTIES", "Item 1B." or "Item IA." (roman I for 1).
 ITEM_HEADING_RE = re.compile(r"^\s*item\s*(\d{1,2}|i)\s*([a-c])?\s*[.:\-—–]", re.I)
+# Matches the "Index to Financial Statements" line that marks where the financial statements start.
 FIN_STATEMENTS_RE = re.compile(r"^\s*index to (?:consolidated )?financial statements\s*$", re.I)
-MAX_HEADING_LEN = 150   # longer lines are prose that happens to start with "Item 7 ..."
-MIN_WORDS = 50          # below this a section is empty or heading-only (Phase 1 threshold)
+MAX_HEADING_LEN = 150   # a longer line is normal prose, even if it starts with "Item 7 ..."
+MIN_WORDS = 50          # a section with fewer words is empty or just a heading, so it is skipped
 
 
 @dataclass
 class Section:
+    """One cleaned section of one filing, plus the filing details it belongs to.
+
+    This is what the chunker receives: the section text (one paragraph per line) and enough
+    metadata to label every chunk made from it.
+    """
+
     cik: str
     ticker: str
     company: str
@@ -59,12 +74,15 @@ class Section:
     period_of_report: str
     filing_date: str
     accession: str
-    section: str        # item_1 | item_1A | item_7 | item_7A
-    text: str           # cleaned; one paragraph per line
+    section: str        # one of item_1, item_1A, item_7, item_7A
+    text: str           # the cleaned text, one paragraph per line
 
 
 def item_key(line: str) -> str | None:
-    """'ITEM 1A. Risk Factors' -> '1a'; None if the line is not a short item heading."""
+    """Turn an item heading into a key, e.g. "ITEM 1A. Risk Factors" -> "1a".
+
+    Returns None if the line is not a short item heading.
+    """
     if len(line) > MAX_HEADING_LEN:
         return None
     m = ITEM_HEADING_RE.match(line)
@@ -75,11 +93,15 @@ def item_key(line: str) -> str | None:
 
 
 def drop_leading_toc(lines: list[str]) -> tuple[list[str], int]:
-    """A table of contents = a run of short lines at the top containing several item
-    headings. Drop the run up to its last item heading (plus that heading's title line)."""
+    """Remove a table of contents at the top of a section.
+
+    A table of contents is a run of short lines holding several item headings. Everything
+    up to its last item heading (plus that heading's title line) is dropped. Returns the
+    remaining lines and the number of lines dropped.
+    """
     last_heading, n_headings = -1, 0
     for i, ln in enumerate(lines):
-        if len(ln) > MAX_HEADING_LEN:      # first real paragraph: the TOC (if any) is over
+        if len(ln) > MAX_HEADING_LEN:      # the first real paragraph: any table of contents has ended
             break
         if item_key(ln):
             last_heading, n_headings = i, n_headings + 1
@@ -87,17 +109,22 @@ def drop_leading_toc(lines: list[str]) -> tuple[list[str], int]:
         return lines, 0
     cut = last_heading + 1
     if cut < len(lines) and len(lines[cut]) <= MAX_HEADING_LEN and not item_key(lines[cut]):
-        cut += 1                           # the title that follows "Item 16." on its own line
+        cut += 1                           # also drop the title on the line after the last heading
     return lines[cut:], cut
 
 
 def trim_at_later_item(sec: str, lines: list[str]) -> tuple[list[str], str | None]:
-    """Cut at the first heading of a later item or at the financial-statements index."""
+    """Cut a section where it runs past its own end.
+
+    The cut happens at the first heading of a later item, or at the financial-statements
+    index. Some filings' sections otherwise run on into the following items. Returns the
+    kept lines and the text of the heading we cut at (or None).
+    """
     own = ITEM_ORDER.index(OWN_ITEM[sec])
-    # Oracle repeats "Index to Financial Statements" as a link on every page: if the line
-    # occurs more than once it is page furniture (dropped later), not where Item 8 starts.
+    # If "Index to Financial Statements" appears more than once it is a repeated page link
+    # (page furniture), not the start of the financial statements.
     fin_is_boundary = sum(bool(FIN_STATEMENTS_RE.match(ln)) for ln in lines) == 1
-    for i, ln in enumerate(lines[1:], start=1):   # line 0 is the section's own heading
+    for i, ln in enumerate(lines[1:], start=1):   # skip line 0, the section's own heading
         key = item_key(ln)
         if key in ITEM_ORDER and ITEM_ORDER.index(key) > own:
             return lines[:i], ln.strip()[:60]
@@ -106,15 +133,17 @@ def trim_at_later_item(sec: str, lines: list[str]) -> tuple[list[str], str | Non
     return lines, None
 
 
-# Running page headers: "PART I", bare "Item 1A", "Intuit Fiscal 2023 Form 10-K",
-# "Veeva Systems Inc. | Form 10-K"; and separator lines like "_______".
+# Patterns for running page headers ("PART I", a bare "Item 1A", "Intuit Fiscal 2023 Form 10-K")
+# and for lines with no letters or digits at all (separators like "_______").
 RUNNING_HEADER_RE = re.compile(r"^(?:part\s+[ivx]+|item\s*\d{1,2}\s*[a-c]?\.?)$", re.I)
 FORM_10K_RE = re.compile(r"form\s*10-?k", re.I)
 NO_TEXT_RE = re.compile(r"^[^A-Za-z0-9]+$")
+# Characters that act as a bullet marker when they sit alone on a line.
 BULLETS = {"•", "●", "·", "▪", "◦", "■", "○", "-", "–", "—", "*"}
 
 
 def is_page_furniture(line: str) -> bool:
+    """Say whether a line is page furniture (page number, running header, separator) rather than content."""
     return bool(PAGE_RE.match(line) or FIN_STATEMENTS_RE.match(line)
                 or RUNNING_HEADER_RE.match(line)
                 or (FORM_10K_RE.search(line) and len(line.split()) <= 10)
@@ -122,8 +151,11 @@ def is_page_furniture(line: str) -> bool:
 
 
 def company_header_lines(lines: list[str], company: str) -> set[str]:
-    """Short lines that repeat the company's name 2+ times in a section: a page header
-    ("Alphabet Inc.", "Blackbaud, Inc."). Matched on the name's first word."""
+    """Find page-header lines that just repeat the company name.
+
+    A short line starting with the company's first word that appears 2 or more times in a
+    section is a page header ("Alphabet Inc.", "Blackbaud, Inc."), not content.
+    """
     first = re.sub(r"[^a-z0-9]", "", company.lower().split()[0])
     counts: dict[str, int] = {}
     for ln in lines:
@@ -133,7 +165,10 @@ def company_header_lines(lines: list[str], company: str) -> set[str]:
 
 
 def join_lone_bullets(lines: list[str]) -> tuple[list[str], int]:
-    """Bullets laid out as a table come out as "•" on its own line: glue it to the next."""
+    """Glue a bullet sign that sits alone on a line to the text on the next line.
+
+    Bullets laid out in a table are extracted as "•" on one line and the text on the next.
+    """
     out, joined = [], 0
     for ln in lines:
         if out and out[-1] in BULLETS:
@@ -144,14 +179,18 @@ def join_lone_bullets(lines: list[str]) -> tuple[list[str], int]:
     return out, joined
 
 
+# Characters that normally end a sentence; used to spot a sentence cut by a page break.
 SENTENCE_END = tuple('.:;!?"”)')
 
 
 def drop_page_lines(lines: list[str], extra: set[str] = frozenset()) -> tuple[list[str], int, int]:
-    """Drop page furniture (plus any lines in `extra`). A page break often falls
-    mid-sentence ("...may not be able to compete eff" / [footer] / "ectively ..."): rejoin
-    the two halves when the text before the break has no end punctuation and the text
-    after starts in lowercase. Line 0 (the section's own heading) is always kept."""
+    """Remove page furniture (and any lines in `extra`), and repair sentences cut by a page break.
+
+    A page break can fall in the middle of a sentence. When the text before the removed
+    lines has no ending punctuation and the text after starts in lowercase, the two halves
+    are joined again. Line 0 (the section's own heading) is always kept. Returns the kept
+    lines, the number dropped and the number of sentences rejoined.
+    """
     out: list[str] = []
     dropped = rejoined = 0
     after_break = False
@@ -170,6 +209,11 @@ def drop_page_lines(lines: list[str], extra: set[str] = frozenset()) -> tuple[li
 
 
 def clean_section(sec: str, text: str, company: str) -> tuple[str, dict]:
+    """Run all cleaning steps on one section's text.
+
+    Returns the cleaned text and a dict of counts (what each step removed), which the
+    report uses to check the cleaning.
+    """
     lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
     words_before = len(text.split())
     lines, toc_lines = drop_leading_toc(lines)
@@ -195,9 +239,12 @@ def clean_section(sec: str, text: str, company: str) -> tuple[str, dict]:
 
 def iter_clean_sections(tickers: list[str] | None = None,
                         stats_out: list[dict] | None = None) -> Iterator[Section]:
-    """Yield cleaned sections for filings in the manifest (optionally only some tickers).
-    Sections left with < MIN_WORDS words are skipped. Pass a list as stats_out to collect
-    per-section cleaning stats (including skipped sections)."""
+    """Yield the cleaned sections of every filing in the manifest (or only some tickers).
+
+    This is the entry point of the pipeline: the chunker reads its sections from here.
+    Sections left with fewer than MIN_WORDS words are skipped. Pass a list as `stats_out`
+    to collect the cleaning counts for each section, including skipped ones.
+    """
     manifest = load_manifest()
     if tickers:
         manifest = manifest[manifest["ticker"].isin(tickers)]
@@ -220,6 +267,7 @@ def iter_clean_sections(tickers: list[str] | None = None,
 
 
 def main() -> None:
+    """Clean the whole corpus and print a report of what each cleaning step changed."""
     stats: list[dict] = []
     n = sum(1 for _ in iter_clean_sections(stats_out=stats))
     df = pd.DataFrame(stats)

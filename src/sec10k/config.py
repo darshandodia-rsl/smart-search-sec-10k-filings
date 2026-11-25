@@ -1,7 +1,13 @@
-"""Shared paths and settings: the one place that knows where things live.
+"""Shared paths and settings for the whole project.
 
-Every module imports locations from here instead of computing them from its own file
-position, so moving a module never breaks a path. Secrets/settings come from .env.
+What it does: defines where the data lives (corpus, caches, state files), which embedding
+model is used, which 10-K sections we handle, and how to connect to Neo4j. It also loads
+the secrets in `.env`.
+
+Why it is needed: every other module (loader, chunker, embedder, graph writers, LLM
+backends) imports locations and settings from here instead of working them out itself.
+That keeps all settings in one place, so changing one (say, the embedding model) changes
+it everywhere at once.
 """
 
 import os
@@ -10,36 +16,47 @@ from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
 
-ROOT = Path(__file__).resolve().parents[2]          # project root (src/sec10k/config.py -> ../..)
+# Project root folder. This file is src/sec10k/config.py, so the root is two levels up.
+ROOT = Path(__file__).resolve().parents[2]
+# Read secrets and overrides (like the Neo4j password) from .env into environment variables.
 load_dotenv(ROOT / ".env")
 
-DATA = ROOT / "data"                                 # git-ignored
-CORPUS = DATA / "edgar-software-corpus"              # downloaded corpus (read-only)
-RAW_10K = CORPUS / "data" / "raw" / "10-K"           # raw filing HTML
-STATE_DIR = DATA / "state"                           # LLM daily-budget counters
-PROFILE_DIR = DATA / "profile"                       # Phase 1 profiling outputs
-HEADINGS_DIR = DATA / "headings"                     # cached emphasized blocks per filing
+DATA = ROOT / "data"                                 # all generated data; not in git
+CORPUS = DATA / "edgar-software-corpus"              # the downloaded 10-K corpus (read-only)
+RAW_10K = CORPUS / "data" / "raw" / "10-K"           # the original filing HTML files
+STATE_DIR = DATA / "state"                           # LLM daily token-budget counters
+PROFILE_DIR = DATA / "profile"                       # output of the corpus profiling scripts
+HEADINGS_DIR = DATA / "headings"                     # cached bold/italic blocks per filing
 
-# Local embedding model. The chunker sizes chunks with this model's tokenizer, so both
-# must always be the same model.
+# The local embedding model and the size of the vectors it produces. The chunker measures
+# chunk sizes with this model's tokenizer, so chunker and embedder must use the same model.
 EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 EMBED_DIM = 768
 
-# The four 10-K sections in the corpus, in document order.
+# The four 10-K sections we use, in the order they appear in a filing:
+# Business, Risk Factors, MD&A, Market Risk.
 SECTIONS = ["item_1", "item_1A", "item_7", "item_7A"]
 
 
 def load_manifest() -> pd.DataFrame:
-    """The authoritative filing list (950 filings, FY2015-2024)."""
+    """Return the official list of filings to process (950 rows, fiscal years 2015-2024).
+
+    Every pipeline step picks its filings from this list, so they all work on the same set.
+    """
     return pd.read_csv(CORPUS / "manifest.csv", dtype={"cik": str})
 
 
-# Neo4j (docker-compose.yml); the password lives only in .env.
+# Neo4j connection settings (the database runs in Docker, see docker-compose.yml).
+# The password is only ever read from .env, never written in code.
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 
 
 def load_companies() -> pd.DataFrame:
-    """The 130 companies (rank, cik, ticker, name, sic, ...)."""
+    """Return the 130 companies in the corpus (rank, cik, ticker, name, sic, ...).
+
+    Used to create the Company nodes in the graph, and later to recognise company names
+    mentioned inside filings.
+    """
     return pd.read_csv(CORPUS / "companies.csv", dtype={"cik": str})

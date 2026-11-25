@@ -31,6 +31,14 @@ than speed.
    say so plainly.
 8. **Update the progress log** in `PLAN.md` at the end of each completed step: date, what was
    done, and anything still open.
+9. **Code comments (every file you generate).**
+   - **Doc comments everywhere:** every file (module docstring), class and method/function gets one.
+   - **Plain language:** write them simply, as if explaining to someone new to the code.
+   - **Say what and why:** each doc comment says what the code does *and* why it is needed in the
+     overall project (where it fits in the pipeline, what depends on it).
+   - **Fresh perspective only:** describe the code as it is now. No history or trade-off
+     stories ("because X couldn't be done, we did Z", "changed from…", "previously…").
+     That belongs in `PLAN.md`'s progress log, not in the code.
 
 ## Settled decisions (don't change without asking)
 | Area | Decision | Why |

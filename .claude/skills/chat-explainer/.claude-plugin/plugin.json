@@ -1,0 +1,1 @@
+{ "name": "chat-explainer", "version": "0.1.0", "description": "Side panel: plain-language summary of the current chat, plus an input box to ask what was built, what changed and why", "types": "./types/index.d.ts" }

@@ -1,19 +1,26 @@
-"""Phase 2.3: write the structural graph (no LLM) to Neo4j.
+"""Writes the structural graph (the skeleton of the data, no LLM) into Neo4j.
+
+The graph shape:
 
     (Company)-[:FILED]->(Filing)-[:HAS_SECTION]->(Section)-[:HAS_CHUNK]->(Chunk)
 
-How each node type is written:
-  Company  LlamaIndex EntityNode (labels __Node__, __Entity__, Company; id = company name).
-           It is a real entity: Phase 3/5 extracted mentions ("Microsoft") resolve onto it.
-  Chunk    LlamaIndex ChunkNode (labels __Node__, Chunk; text + metadata as properties):
-           the format PropertyGraphIndex expects, so extraction attaches to these chunks.
-  Filing,  our own Cypher (labels __Node__ + Filing / Section, NOT __Entity__). LlamaIndex
-  Section  has no type for structural nodes, and as __Entity__ they would show up in
-           entity search later as if a filing were a company or a risk.
+So a company has filings, a filing has sections, and a section is cut into chunks.
 
-Idempotent: every node is MERGEd by id (unique constraint on __Node__.id), so a re-run
-updates instead of duplicating. If re-chunking yields fewer chunks for a section, the
-leftover chunks are deleted, so the graph always matches the current chunker.
+Why it is needed: this is the backbone of the whole system. Embeddings attach to the Chunk
+nodes, extracted entities (competitors, risks, products) will link back to the chunks they
+came from, and answers can cite the company, year and section by following these edges.
+
+How each node type is stored:
+  Company  A LlamaIndex `EntityNode` (id = company name). It is a real entity, so company
+           names mentioned in the text will later be linked to it.
+  Chunk    A LlamaIndex `ChunkNode` (text plus metadata as properties). This is the format
+           LlamaIndex's PropertyGraphIndex expects, so extraction can attach to it.
+  Filing   Written with our own Cypher, and deliberately NOT marked as an entity, so
+  Section  entity search never mistakes a filing or section for a company or a risk.
+
+Safe to re-run: every node is written with MERGE by id, so running again updates nodes
+instead of duplicating them. If a section now has fewer chunks than before, the extra old
+chunks are deleted, so the graph always matches the current chunker output.
 
 Run from the project root:  .venv/bin/python -m sec10k.graph.structure [TICKER ...]
 (no tickers = full corpus)
@@ -30,10 +37,15 @@ from sec10k.graph.store import get_graph_store
 from sec10k.ingest.chunker import Chunk, iter_chunks
 from sec10k.ingest.loader import SECTION_TITLES
 
-BATCH_CHUNKS = 2000     # chunks per write round (~2 MB of text per round)
+BATCH_CHUNKS = 2000     # chunks written per round (about 2 MB of text), to keep memory small
 
 
 def write_companies(store, companies) -> None:
+    """Create or update one Company node per company in `companies`.
+
+    Company nodes are the top of the graph: every filing hangs off one, and company names
+    found in the text will later be matched to them.
+    """
     store.upsert_nodes([
         EntityNode(name=r.name, label="Company",
                    properties={"cik": r.cik, "ticker": r.ticker, "sic": int(r.sic), "rank": int(r.rank)})
@@ -42,7 +54,12 @@ def write_companies(store, companies) -> None:
 
 
 def write_filings(store, manifest) -> None:
-    rows = [{"id": r.accession_number, "company_id": r.name,
+    """Create or update one Filing node per manifest row, linked from its Company.
+
+    A Filing carries the facts that identify it (accession number, fiscal year, dates), so
+    questions like "what changed between 2022 and 2023" can filter by year.
+    """
+    rows =[{"id": r.accession_number, "company_id": r.name,
              "props": {"accession": r.accession_number, "cik": r.cik, "ticker": r.ticker,
                        "fiscal_year": int(r.fiscal_year), "period_of_report": r.period_of_report,
                        "filing_date": r.filing_date, "form": "10-K"}}
@@ -61,7 +78,11 @@ def write_filings(store, manifest) -> None:
 
 
 def write_batch(store, chunks: list[Chunk]) -> None:
-    """Sections, chunks and their edges for a batch of whole sections."""
+    """Write a batch of chunks, plus their Section nodes and all the edges between them.
+
+    The batch must contain whole sections (never half of one), because stale chunks are
+    cleaned up per section and that needs the section's full chunk list.
+    """
     sections = []
     for (acc, sec), group in groupby(chunks, key=lambda c: (c.accession, c.section)):
         group = list(group)
@@ -84,7 +105,7 @@ def write_batch(store, chunks: list[Chunk]) -> None:
         """,
         param_map={"rows": sections},
     )
-    # 2. Chunk nodes, through LlamaIndex (no embedding yet: added in step 2.4)
+    # 2. Chunk nodes, written through LlamaIndex (vectors are added later by ingest/embed.py)
     store.upsert_nodes([
         ChunkNode(text=c.text, id_=c.chunk_id, properties={
             "cik": c.cik, "ticker": c.ticker, "fiscal_year": c.fiscal_year,
@@ -94,7 +115,7 @@ def write_batch(store, chunks: list[Chunk]) -> None:
         })
         for c in chunks
     ])
-    # 3. Section->Chunk edges, and delete chunks left over from an earlier, longer chunking
+    # 3. Section->Chunk edges, then delete chunks of the section that are no longer produced
     store.structured_query(
         """
         UNWIND $rows AS row
@@ -117,6 +138,11 @@ def write_batch(store, chunks: list[Chunk]) -> None:
 
 
 def build(tickers: list[str] | None = None) -> None:
+    """Build the whole structural graph, or only the given companies, then print a report.
+
+    Order: companies, filings, then sections and chunks in batches. This is the entry point
+    of the module and the first step of putting data into the graph.
+    """
     store = get_graph_store()
     manifest = load_manifest()
     companies = load_companies()
@@ -132,7 +158,7 @@ def build(tickers: list[str] | None = None) -> None:
     batch: list[Chunk] = []
     n_chunks = 0
     for _, filing_chunks in groupby(iter_chunks(tickers), key=lambda c: c.accession):
-        batch.extend(filing_chunks)           # batches always hold whole filings
+        batch.extend(filing_chunks)           # add whole filings, so a batch never splits a section
         if len(batch) >= BATCH_CHUNKS:
             write_batch(store, batch)
             n_chunks += len(batch)
@@ -146,6 +172,12 @@ def build(tickers: list[str] | None = None) -> None:
 
 
 def report(store, tickers: list[str] | None) -> None:
+    """Print node and edge counts, two sanity checks and a few sample paths.
+
+    The checks look for chunks with no section and sections whose chunk count does not
+    match what was written. Both should be 0 on a healthy graph. Run after `build` to
+    confirm the write worked.
+    """
     q = store.structured_query
     p = {"t": tickers}
     flt = "WHERE ($t IS NULL OR n.ticker IN $t)"

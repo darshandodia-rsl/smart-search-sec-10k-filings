@@ -1,18 +1,28 @@
-"""Phase 2.4: embed every Chunk node in Neo4j and build the vector index.
+"""Gives every Chunk node in Neo4j a vector and creates the vector index.
 
-Resumable and never pays twice: each round fetches chunks that still need a vector,
-embeds them, and writes the vectors back in one transaction. A chunk needs a vector if
-  - it has none, or
-  - its text changed since it was embedded (embedded_hash <> content_hash), or
-  - it was embedded with a different model (embedding_model <> EMBED_MODEL).
-Stop or crash at any time: re-running continues where it left off; at most one batch
-is redone.
+What it does: finds chunks that have no up-to-date vector, embeds them with the local
+model, and stores the vector on the chunk. It also creates the Neo4j vector index that
+makes "find chunks similar to this question" fast.
 
-The text embedded is build_embed_text(): "COMPANY (TICKER) 10-K FYyyyy | Item ... | heading"
-+ chunk text, rebuilt from the chunk's properties so it matches what the chunker defined.
+Why it is needed: vector search is the base of retrieval. Without these vectors we cannot
+find chunks by meaning, and the plain-RAG baseline (which the graph methods are later
+compared against) would not exist.
+
+Safe to stop and restart: each round fetches chunks that still need a vector, embeds them,
+and saves the vectors in one transaction. A chunk needs a vector if
+  - it has none yet, or
+  - its text changed since it was embedded (`embedded_hash` differs from `content_hash`), or
+  - it was embedded with a different model than the current `EMBED_MODEL`.
+If the run stops at any point, running it again continues from there. At most one batch
+of work is repeated.
+
+The text that gets embedded is `build_embed_text()`: a short header
+("COMPANY (TICKER) 10-K FYyyyy | Item ... | heading") followed by the chunk text. The header
+tells the model which company, year and section the chunk comes from.
 
 Run from the project root:  .venv/bin/python -m sec10k.ingest.embed [TICKER ...] [--limit N]
-(no tickers = all chunks; --limit = stop after N chunks, e.g. to let the machine cool down)
+(no tickers = all chunks; --limit stops after about N chunks, which lets a long run be
+split into smaller runs with pauses between them)
 """
 
 import argparse
@@ -23,9 +33,11 @@ from sec10k.embeddings import get_embed_model
 from sec10k.graph.store import get_graph_store
 from sec10k.ingest.chunker import build_embed_text
 
-BATCH = 512                    # chunks per fetch/write round
-INDEX_NAME = "chunk_embedding"
+BATCH = 512                    # chunks fetched, embedded and saved per round
+INDEX_NAME = "chunk_embedding"  # name of the Neo4j vector index on Chunk.embedding
 
+# Cypher condition (used inside a WHERE) that picks the chunks still needing a vector.
+# $t = list of tickers or null for all, $model = the current embedding model name.
 NEEDS_VECTOR = """
     ($t IS NULL OR c.ticker IN $t)
     AND (c.embedding IS NULL OR c.embedded_hash IS NULL OR c.embedded_hash <> c.content_hash
@@ -34,8 +46,12 @@ NEEDS_VECTOR = """
 
 
 def create_vector_index(store) -> None:
-    """Cosine similarity on normalized 768-dim bge vectors. Neo4j fills the index in the
-    background as vectors are written."""
+    """Create the vector index on Chunk.embedding if it does not exist yet.
+
+    The index uses cosine similarity on 768-dimension vectors, matching our bge model.
+    Neo4j fills it in the background as vectors are saved, and search queries use it to
+    find similar chunks quickly.
+    """
     store.structured_query(f"""
         CREATE VECTOR INDEX {INDEX_NAME} IF NOT EXISTS
         FOR (c:Chunk) ON c.embedding
@@ -45,8 +61,11 @@ def create_vector_index(store) -> None:
 
 
 def run(tickers: list[str] | None = None, limit: int | None = None) -> None:
-    """Embed chunks that need a vector; with `limit`, stop after about that many
-    (whole rounds of BATCH), e.g. to run the corpus in cool-down-separated batches."""
+    """Embed all chunks that need a vector (optionally only some companies).
+
+    With `limit`, stop after about that many chunks (always whole rounds of `BATCH`), so a
+    long job can be run in smaller pieces with breaks between them.
+    """
     store = get_graph_store()
     create_vector_index(store)
     params = {"t": tickers, "model": EMBED_MODEL}
@@ -90,6 +109,10 @@ def run(tickers: list[str] | None = None, limit: int | None = None) -> None:
 
 
 def report(tickers: list[str] | None = None) -> None:
+    """Print how many chunks have a vector, how many are still to do, and the index state.
+
+    Run after `run` to confirm the job finished and the index is fully built (ONLINE, 100%).
+    """
     store = get_graph_store()
     p = {"t": tickers, "model": EMBED_MODEL}
     r = store.structured_query(f"""
