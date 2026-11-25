@@ -16,6 +16,8 @@ Built-in guards (a simple version; a fuller rate limiter and a response cache ar
 for the production ingestion pipeline):
   - retries with waiting  -> the openai SDK's built-in `max_retries` (Groq only)
   - request pacing        -> at most N requests per minute, per backend
+  - tokens per minute     -> waits until the last 60 seconds have room for the next call
+                             (only for backends with a per-minute token limit, i.e. Groq)
   - daily token budget    -> refuses to call once today's tokens would pass the limit; the
                              count is saved to a JSON file so it survives restarts
 """
@@ -29,6 +31,7 @@ import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
 from datetime import date
 
@@ -125,6 +128,58 @@ class RequestPacer:
             self._last = time.monotonic()
 
 
+class TokenRateLimiter:
+    """Keeps the tokens sent in any 60-second window under `per_minute`, waiting when needed.
+
+    Groq's free tier rejects calls once a minute's tokens pass its limit (8K), and a single
+    Q&A call can use ~4K, so two quick questions are enough to hit it. This class keeps a
+    list of (time, tokens) for recent calls. Before a call it reserves an estimate; once the
+    real count is known, `settle()` replaces the estimate. The count lives in memory only, so
+    it covers one process.
+    """
+
+    WINDOW = 60.0  # seconds
+
+    def __init__(self, per_minute: int):
+        self.limit = per_minute
+        self._events: deque[list] = deque()  # [time, tokens], oldest first
+        self._lock = threading.Lock()
+
+    def acquire(self, estimated_tokens: int) -> list:
+        """Wait until `estimated_tokens` fits in the window, reserve it, and return the reservation.
+
+        Raises `ValueError` if one call alone is larger than the limit, since waiting would
+        never help.
+        """
+        if estimated_tokens > self.limit:
+            raise ValueError(
+                f"one call of ~{estimated_tokens:,} tokens exceeds the {self.limit:,} tokens/min limit"
+            )
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._events and self._events[0][0] <= now - self.WINDOW:
+                    self._events.popleft()
+                used = sum(tokens for _, tokens in self._events)
+                if used + estimated_tokens <= self.limit:
+                    entry = [now, estimated_tokens]
+                    self._events.append(entry)
+                    return entry
+                # Find how long until enough of the oldest calls leave the window.
+                need, freed, delay = used + estimated_tokens - self.limit, 0, 0.0
+                for t, tokens in self._events:
+                    freed += tokens
+                    if freed >= need:
+                        delay = t + self.WINDOW - now
+                        break
+            time.sleep(max(delay, 0.0) + 0.05)
+
+    def settle(self, entry: list, actual_tokens: int) -> None:
+        """Replace a reservation's estimate with the real token count of the finished call."""
+        with self._lock:
+            entry[1] = actual_tokens
+
+
 def _estimate_tokens(text: str) -> int:
     """Roughly estimate the tokens in a text, to check the budget before a call is made."""
     return len(text) // 4  # about 4 characters per token in English
@@ -137,26 +192,34 @@ class LLMProvider(ABC):
     """The common interface of all LLM backends: one `complete()` call.
 
     The rest of the project only talks to this class, so the vendor can be swapped without
-    changing other code. The guards (budget, pacing) live here so every backend gets them.
+    changing other code. The guards (budget, pacing, tokens per minute) live here so every
+    backend gets them. `tokens_per_minute=None` means the backend has no per-minute token limit.
     """
 
     backend: str
 
-    def __init__(self, model: str, daily_token_limit: int, requests_per_minute: int):
+    def __init__(self, model: str, daily_token_limit: int, requests_per_minute: int,
+                 tokens_per_minute: int | None = None):
         self.model = model
         self.budget = DailyTokenBudget(self.backend, daily_token_limit)
         self.pacer = RequestPacer(requests_per_minute)
+        self.tpm = TokenRateLimiter(tokens_per_minute) if tokens_per_minute else None
 
     def complete(self, prompt: str, system: str | None = None, max_tokens: int = 1024) -> LLMResponse:
         """Send one prompt and return the answer.
 
-        Checks the daily budget, waits for the pacer, calls the backend, then records the
-        tokens used. `max_tokens` caps the length of the answer.
+        Checks the daily budget, waits for room in the tokens-per-minute window and for the
+        pacer, calls the backend, then records the tokens used. `max_tokens` caps the length
+        of the answer. If the call fails, its reservation keeps the estimate, because a failed
+        call may still have counted against the provider's limit.
         """
         estimate = _estimate_tokens(prompt + (system or "")) + max_tokens
         self.budget.check(estimate)
+        reservation = self.tpm.acquire(estimate) if self.tpm else None
         self.pacer.wait()
         resp = self._complete(prompt, system, max_tokens)
+        if reservation is not None:
+            self.tpm.settle(reservation, resp.total_tokens)
         self.budget.record(resp.total_tokens)
         return resp
 
@@ -172,7 +235,7 @@ class GroqProvider(LLMProvider):
     """Calls openai/gpt-oss-120b on Groq through its OpenAI-compatible API (free tier).
 
     Limits come from environment variables and default to the free tier's: 30 requests a
-    minute and 200K tokens a day.
+    minute, 8K tokens a minute and 200K tokens a day.
     """
 
     backend = "groq"
@@ -185,6 +248,7 @@ class GroqProvider(LLMProvider):
             model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
             daily_token_limit=int(os.getenv("GROQ_DAILY_TOKENS", "200000")),
             requests_per_minute=int(os.getenv("GROQ_RPM", "30")),
+            tokens_per_minute=int(os.getenv("GROQ_TPM", "8000")),
         )
         self.client = OpenAI(
             api_key=os.environ["GROQ_API_KEY"],

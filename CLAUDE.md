@@ -74,6 +74,7 @@ smart-search-sec-10k-filings/      ← project root (run commands from here)
 │   ├── embeddings.py              ← the one embedding model (chunker tokenizer must match it)
 │   ├── ingest/                    ← pipeline: loader, headings, chunker, embed
 │   ├── graph/                     ← Neo4j store + graph writers (retrieval/, api/ later)
+│   ├── extract/                   ← extraction tiers: alias/pattern matching, local NLP, LLM
 │   └── analysis/                  ← one-off studies; may import the pipeline, never the reverse
 ├── corpus/                        ← scripts + frozen snapshot to rebuild the corpus (in git)
 └── data/                          ← git-ignored

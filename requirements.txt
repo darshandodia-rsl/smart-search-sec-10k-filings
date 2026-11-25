@@ -12,3 +12,10 @@ torch==2.15.0
 # LLM backends (Groq uses the OpenAI-compatible API) + config from .env
 openai==3.58.0
 python-dotenv==1.2.4
+
+# GLiNER needs transformers < 5.23; 5.22.2 verified to reproduce the stored bge vectors exactly
+transformers==5.22.2
+
+# Local NLP for extraction tier 3 (company / product / place names)
+gliner==0.2.30
+protobuf==7.36.2                          # needed by GLiNER to read its DeBERTa tokenizer

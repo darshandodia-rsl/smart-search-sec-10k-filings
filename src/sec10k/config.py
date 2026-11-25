@@ -27,6 +27,9 @@ RAW_10K = CORPUS / "data" / "raw" / "10-K"           # the original filing HTML 
 STATE_DIR = DATA / "state"                           # LLM daily token-budget counters
 PROFILE_DIR = DATA / "profile"                       # output of the corpus profiling scripts
 HEADINGS_DIR = DATA / "headings"                     # cached bold/italic blocks per filing
+ENTITIES_DIR = DATA / "entities"                     # raw GLiNER entities per filing (tier 3)
+# Hand-checked names each corpus company goes by (in git, next to the code that uses it).
+COMPANY_ALIASES = ROOT / "src" / "sec10k" / "extract" / "company_aliases.csv"
 
 # The local embedding model and the size of the vectors it produces. The chunker measures
 # chunk sizes with this model's tokenizer, so chunker and embedder must use the same model.
