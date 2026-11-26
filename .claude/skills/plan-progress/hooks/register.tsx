@@ -117,6 +117,8 @@ async function readYearProgress($: any): Promise<Map<string, 'full' | 'part'>> {
 
 // Box colour for a partly extracted year: a dimmer green than a finished one.
 const PART_GREEN = '#2f7d43'
+// Darker green for companies whose every filing (all years) is extracted.
+const COMPLETE_GREEN = '#238636'
 
 /** One company's extraction progress, as read from the job store. */
 type CompanyRow = {
@@ -326,6 +328,24 @@ export const register: Register = on => {
     const active = rows.filter(r => r.backend && left(r) > 0)
     const queued = rows.filter(r => !r.backend && !finished.includes(r))
     const notAdded = Math.max(0, TOTAL_COMPANIES - rows.length)
+    // Totally complete: caught up AND every year the company filed a 10-K for is fully extracted
+    // (a company can be "caught up" on just the first years added so far).
+    const complete: CompanyRow[] = []
+    for (const r of finished) {
+      const filedYears = filings ? filings.filed.get(r.ticker) : undefined
+      if (!filedYears || filedYears.size === 0) continue
+      let all = true
+      filedYears.forEach(y => {
+        if (yearProgress.get(`${r.ticker}:${y}`) !== 'full') all = false
+      })
+      if (all) complete.push(r)
+    }
+    // Light part of the bar: caught-up companies with years still to add, plus each
+    // in-progress company's fraction done.
+    const partial =
+      finished.length -
+      complete.length +
+      active.reduce((n, r) => n + (r.total ? (r.done ?? 0) / r.total : 0), 0)
     const itemsDone = rows.reduce((s, r) => s + (r.done ?? 0), 0)
     const itemsTotal = rows.reduce((s, r) => s + (r.total ?? 0), 0)
 
@@ -349,6 +369,21 @@ export const register: Register = on => {
         <Text color={color}>
           {'█'.repeat(f)}
           <Text color={C.track}>{'░'.repeat(width - f)}</Text>
+        </Text>
+      )
+    }
+    // Two-tone bar: green = totally complete companies, amber = partly done (in progress or caught up so far).
+    const companiesBar = (dark: number, light: number, total: number, width: number) => {
+      const fd = Math.max(0, Math.min(width, Math.round((dark / total) * width)))
+      const fl = Math.max(
+        0,
+        Math.min(width - fd, light > 0 ? Math.max(1, Math.round((light / total) * width)) : 0),
+      )
+      return (
+        <Text>
+          <Text color={COMPLETE_GREEN}>{'█'.repeat(fd)}</Text>
+          <Text color={C.current}>{'█'.repeat(fl)}</Text>
+          <Text color={C.track}>{'░'.repeat(width - fd - fl)}</Text>
         </Text>
       )
     }
@@ -434,7 +469,7 @@ export const register: Register = on => {
               {finished.length} / {TOTAL_COMPANIES} caught up
               <Text color={C.muted}> · {Math.round((finished.length / TOTAL_COMPANIES) * 100)}%</Text>
             </Text>
-            {bar(finished.length / TOTAL_COMPANIES, Math.min(30, w), C.done)}
+            {companiesBar(complete.length, partial, TOTAL_COMPANIES, Math.min(30, w))}
             <Text color={C.muted}>
               <Text color={C.current}>◐ {active.length}</Text> in progress · ○ {queued.length} queued ·{' '}
               {notAdded} not added
@@ -489,6 +524,8 @@ export const register: Register = on => {
 
         {finished.length > 0 && card('Caught up', C.done, tickers(finished))}
 
+        {queued.length > 0 && card('Queued', C.muted, tickers(queued))}
+
         {card(
           'LLM usage',
           C.current,
@@ -521,8 +558,6 @@ export const register: Register = on => {
               </Text>
             </Box>,
           )}
-
-        {queued.length > 0 && card('Queued', C.muted, tickers(queued))}
       </Box>
     )
   })
