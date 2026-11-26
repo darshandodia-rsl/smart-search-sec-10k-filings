@@ -24,7 +24,12 @@ load_dotenv(ROOT / ".env")
 DATA = ROOT / "data"                                 # all generated data; not in git
 CORPUS = DATA / "edgar-software-corpus"              # the downloaded 10-K corpus (read-only)
 RAW_10K = CORPUS / "data" / "raw" / "10-K"           # the original filing HTML files
-STATE_DIR = DATA / "state"                           # LLM daily token-budget counters
+STATE_DIR = DATA / "state"                           # pipeline state: LLM token-budget counters, job store
+JOBS_DB = STATE_DIR / "extraction_jobs.sqlite"       # extraction job store: status of every work item
+SONNET_ALLOWANCE = STATE_DIR / "sonnet_allowance.json"  # the user's current daytime Sonnet allowance
+LOGS_DIR = DATA / "logs"                             # logs of long-running jobs
+EXTRACTION_LOG = LOGS_DIR / "extraction.log"         # the extraction runner's full log
+EXTRACTION_EVENTS = LOGS_DIR / "extraction_events.jsonl"  # notable run events, one JSON object per line
 PROFILE_DIR = DATA / "profile"                       # output of the corpus profiling scripts
 HEADINGS_DIR = DATA / "headings"                     # cached bold/italic blocks per filing
 ENTITIES_DIR = DATA / "entities"                     # raw GLiNER entities per filing (tier 3, never edited)

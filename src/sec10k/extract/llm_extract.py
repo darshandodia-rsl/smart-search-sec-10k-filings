@@ -46,7 +46,7 @@ from sec10k.graph.schema import (ENTITY_TYPES, RELATION_TYPES, RISK_CATEGORIES, 
 from sec10k.ingest.chunker import Chunk, iter_chunks
 from sec10k.llm.providers import LLMProvider, LLMResponse, get_llm
 
-PROMPT_VERSION = 2
+PROMPT_VERSION = 6
 # Batch sizes per call: (risk titles, route-B chunks, max output tokens). Groq's free tier
 # allows 8K tokens per minute, counted as input + allowed output (which includes gpt-oss's
 # reasoning), so one Groq call must stay well under 8K; the other backends take larger batches.
@@ -107,6 +107,13 @@ Rules:
 7. The 4th element is evidence: the shortest exact words from the passage that state the
    fact, at most 10 words.
 8. If a passage has no fact that fits, give it an empty list.
+9. HAS_SUPPLIER vs INTEGRATES_WITH:
+   - HAS_SUPPLIER: the other company provides something the filing company uses itself:
+     components, manufacturing, data centers or cloud hosting for its own platform.
+     "we host our platform on AWS" -> ["SELF", "HAS_SUPPLIER", "Company:Amazon Web Services", ...]
+   - INTEGRATES_WITH: the filing company's products run on, are deployed on or integrate with
+     the other company's platform for customers.
+     "our firewall can be deployed on VMware ESXi" -> ["SELF", "INTEGRATES_WITH", "Company:VMware", ...]
 
 Answer with compact JSON only, no other text: an object mapping each passage number to its facts.
 {{"1": [["SELF", "COMPETES_WITH", "Company:Oracle", "faces competition from Amazon, Google, IBM, Oracle"],
@@ -119,18 +126,28 @@ def _filer_name(ticker: str) -> str:
     return load_aliases().query("ticker == @ticker").alias.iloc[0]
 
 
-def prompt_a(name: str, ticker: str, fy: int, titles: list[str]) -> str:
-    """The user prompt of one route-A call: the company and its numbered risk titles."""
+def prompt_a(name: str, ticker: str, titles: list[str]) -> str:
+    """The user prompt of one route-A call: the company and its numbered risk titles.
+
+    The titles may come from several of the company's filings. No fiscal year is given,
+    because classifying a risk title does not depend on it; the year of each resulting risk
+    is taken from the job store, not from the LLM.
+    """
     lines = "\n".join(f"{i}. {t}" for i, t in enumerate(titles, 1))
-    return f"Company: {name} ({ticker}), 10-K fiscal year {fy}.\n\nRisk-factor titles:\n{lines}"
+    return f"Company: {name} ({ticker}), 10-K annual reports.\n\nRisk-factor titles:\n{lines}"
 
 
-def prompt_b(name: str, ticker: str, fy: int, chunks: list[Chunk]) -> str:
-    """The user prompt of one route-B call: the filing company and its numbered passages."""
-    parts = [f"Filing company: {name} ({ticker}), 10-K fiscal year {fy}.\n"]
+def prompt_b(name: str, ticker: str, chunks: list[Chunk]) -> str:
+    """The user prompt of one route-B call: the filing company and its numbered passages.
+
+    The passages may come from several of the company's filings, so each passage header
+    names its own fiscal year. A batch never mixes companies, because "SELF" in the answer
+    stands for the one filing company.
+    """
+    parts = [f"Filing company: {name} ({ticker}), 10-K annual reports.\n"]
     for i, c in enumerate(chunks, 1):
         head = f" | heading: {c.heading}" if c.heading else ""
-        parts.append(f"--- Passage {i} ({SECTION_NAMES[c.section]}{head})\n{c.text}\n")
+        parts.append(f"--- Passage {i} (FY{c.fiscal_year}, {SECTION_NAMES[c.section]}{head})\n{c.text}\n")
     return "\n".join(parts)
 
 
@@ -157,14 +174,30 @@ def _parse_json(text: str) -> dict | None:
         return None
 
 
+def _cache_path(llm: LLMProvider, system: str, prompt: str):
+    """Where the cached answer to (system, prompt) on this backend and model is stored.
+
+    The key includes PROMPT_VERSION, the backend and the model, so changing any of them asks again.
+    """
+    key = hashlib.sha1(json.dumps([PROMPT_VERSION, llm.backend, llm.model, system, prompt]).encode()).hexdigest()
+    return LLM_CACHE_DIR / f"{key}.json"
+
+
+def drop_cached(llm: LLMProvider, system: str, prompt: str) -> None:
+    """Delete a cached answer, so the next identical call really asks the LLM again.
+
+    Used by the pipeline worker when an answer is unusable (e.g. not valid JSON): otherwise a
+    retry of the same prompt would get the same bad answer back from the cache forever.
+    """
+    _cache_path(llm, system, prompt).unlink(missing_ok=True)
+
+
 def call_cached(llm: LLMProvider, system: str, prompt: str, max_tokens: int) -> CallResult:
     """Return the LLM's answer to (system, prompt), from the disk cache if it was asked before.
 
-    The cache key includes PROMPT_VERSION, the backend and the model, so changing any of them
-    asks again. Cached answers keep their original token counts for reporting.
+    Cached answers keep their original token counts for reporting.
     """
-    key = hashlib.sha1(json.dumps([PROMPT_VERSION, llm.backend, llm.model, system, prompt]).encode()).hexdigest()
-    path = LLM_CACHE_DIR / f"{key}.json"
+    path = _cache_path(llm, system, prompt)
     if path.exists():
         d = json.loads(path.read_text())
         r = LLMResponse(**d["response"])
@@ -182,6 +215,31 @@ def call_cached(llm: LLMProvider, system: str, prompt: str, max_tokens: int) -> 
 # --------------------------------------------------------------------------------------
 # Choosing the inputs of a filing
 # --------------------------------------------------------------------------------------
+def is_route_a_title(chunk: Chunk) -> bool:
+    """True if the chunk's heading is an Item 1A risk title that route A should classify.
+
+    All-caps headings are group headings ("OPERATIONAL RISKS"), and a heading that starts with
+    "Item 1A" is the section's own title ("Item 1A. Risk Factors"); neither is a risk title, so
+    both are left out. Shared by the prototype and the production planner so both pick the
+    same titles.
+    """
+    return (chunk.section == "item_1A" and bool(chunk.heading) and not chunk.heading.isupper()
+            and not re.match(r"item\s*1a\b", chunk.heading.strip(), re.I))
+
+
+def is_route_b(chunk: Chunk, entities: list, matcher: CompanyMatcher, ticker: str) -> bool:
+    """True if the chunk names a company other than the filer, so route B should read it.
+
+    A chunk qualifies through any of: a cleaned tier-3 (GLiNER) company entity, a tier-2
+    relationship cue followed by a name, or a tier-2 match of another corpus company.
+    `entities` are the chunk's cleaned tier-3 entities. Shared by the prototype and the
+    production planner so both flag the same chunks.
+    """
+    return (names_other_company(entities)
+            or any(q.named for q in find_cues(chunk.text))
+            or any(not x.is_self for x in matcher.find(chunk.text, ticker)))
+
+
 def filing_inputs(ticker: str, fy: int) -> tuple[dict, list[str], list[Chunk]]:
     """Return (filing row, route-A titles, route-B chunks) for one filing.
 
@@ -199,15 +257,12 @@ def filing_inputs(ticker: str, fy: int) -> tuple[dict, list[str], list[Chunk]]:
                 seen_titles.add(c.heading)
         elif c.fiscal_year == fy:
             chunks.append(c)
-    titles = list(dict.fromkeys(c.heading for c in chunks if c.section == "item_1A" and c.heading
-                                and c.heading not in seen_titles
-                                and not c.heading.isupper()))  # skip section headings ("OPERATIONAL RISKS")
+    titles = list(dict.fromkeys(c.heading for c in chunks
+                                if is_route_a_title(c) and c.heading not in seen_titles))
     ents = load_entities(row.accession_number)
     matcher = CompanyMatcher()
-    route_b = [c for c in chunks if c.content_hash not in seen_hashes and (
-        names_other_company(ents.get(c.chunk_id, []))
-        or any(q.named for q in find_cues(c.text))
-        or any(not x.is_self for x in matcher.find(c.text, ticker)))]
+    route_b = [c for c in chunks if c.content_hash not in seen_hashes
+               and is_route_b(c, ents.get(c.chunk_id, []), matcher, ticker)]
     return row, titles, route_b
 
 
@@ -343,6 +398,54 @@ def validate_b(facts: list, chunk_text: str, filer: str, stats: dict) -> list[di
     return list(out.values())
 
 
+def answers_a(data: dict | None, titles: list[str], stats: dict) -> list[dict | None]:
+    """Turn a route-A answer into one entry per title, in the same order as `titles`.
+
+    An entry is the title's classification ({title, risk, category, places}), or None when the
+    answer has no usable item for it (missing, or a category outside the schema); those are
+    counted in `stats`. Shared by the prototype and the pipeline worker.
+    """
+    got = {}
+    for it in (data.get("risks", []) if isinstance(data, dict) else []):
+        if isinstance(it, dict):
+            try:
+                got[int(it.get("id"))] = it
+            except (TypeError, ValueError):
+                pass
+    out: list[dict | None] = []
+    for i, title in enumerate(titles, 1):
+        it = got.get(i)
+        if not it:
+            stats["missing"] += 1
+            out.append(None)
+        elif it.get("category") not in RISK_CATEGORIES:
+            stats["bad_category"] += 1
+            out.append(None)
+        else:
+            out.append({"title": title, "risk": it.get("risk"), "category": it["category"],
+                        "places": it.get("places", [])})
+    return out
+
+
+def answers_b(data: dict | None, chunks: list[Chunk], filer: str, stats: dict) -> list[list[dict] | None]:
+    """Turn a route-B answer into one validated fact list per chunk, in the same order as `chunks`.
+
+    An entry is None when the answer has no entry for that passage (counted in `stats`); an
+    empty list means the LLM found no facts in it. Shared by the prototype and the pipeline worker.
+    """
+    got = data if isinstance(data, dict) else {}
+    out: list[list[dict] | None] = []
+    for i, c in enumerate(chunks, 1):
+        facts = got.get(str(i))
+        if facts is None:
+            stats["missing_passage"] += 1
+            out.append(None)
+        else:
+            out.append(validate_b(facts if isinstance(facts, list) else [],
+                                  f"{c.heading or ''}\n{c.text}", filer, stats))
+    return out
+
+
 # --------------------------------------------------------------------------------------
 # Running the prototype on one filing
 # --------------------------------------------------------------------------------------
@@ -372,34 +475,17 @@ def run(ticker: str, fy: int, backend: str = "claude_cli",
     out_a, stats_a = [], Counter()
     batches = [titles[i:i + titles_per_call] for i in range(0, len(titles), titles_per_call)]
     for batch in batches[:max_a_calls]:
-        res = call_cached(llm, SYSTEM_A, prompt_a(name, ticker, fy, batch), max_tokens=max_out)
+        res = call_cached(llm, SYSTEM_A, prompt_a(name, ticker, batch), max_tokens=max_out)
         account(res, "A")
-        got = {it.get("id"): it for it in (res.data or {}).get("risks", [])}
-        for i, title in enumerate(batch, 1):
-            it = got.get(i)
-            if not it:
-                stats_a["missing"] += 1
-                continue
-            if it.get("category") not in RISK_CATEGORIES:
-                stats_a["bad_category"] += 1
-                continue
-            out_a.append({"title": title, "risk": it.get("risk"), "category": it["category"],
-                          "places": it.get("places", [])})
+        out_a += [a for a in answers_a(res.data, batch, stats_a) if a]
     # Route B
     out_b, stats_b = [], Counter()
     groups = [chunks[i:i + chunks_per_call] for i in range(0, len(chunks), chunks_per_call)]
     for group in groups[:max_b_calls]:
-        res = call_cached(llm, SYSTEM_B, prompt_b(name, ticker, fy, group), max_tokens=max_out)
+        res = call_cached(llm, SYSTEM_B, prompt_b(name, ticker, group), max_tokens=max_out)
         account(res, "B")
-        got = res.data if isinstance(res.data, dict) else {}
-        for i, c in enumerate(group, 1):
-            facts = got.get(str(i))
-            if facts is None:
-                stats_b["missing_passage"] += 1
-                continue
-            out_b.append({"chunk_id": c.chunk_id, "section": c.section, "heading": c.heading,
-                          "facts": validate_b(facts if isinstance(facts, list) else [],
-                                                  f"{c.heading or ''}\n{c.text}", name, stats_b)})
+        out_b += [{"chunk_id": c.chunk_id, "section": c.section, "heading": c.heading, "facts": facts}
+                  for c, facts in zip(group, answers_b(res.data, group, name, stats_b)) if facts is not None]
 
     meta = {"ticker": ticker, "fiscal_year": fy, "accession": row.accession_number,
             "backend": backend, "model": llm.model, "prompt_version": PROMPT_VERSION,

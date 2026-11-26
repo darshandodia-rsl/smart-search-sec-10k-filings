@@ -1,11 +1,207 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
+import type { AgyMeters, Meter } from '../types'
+
 const PANE = 'plan-progress'
 // Bumped after each tool call so the pane re-reads PLAN.md, git and budgets.
 const tick = atom({ plugin: 'plan-progress', key: 'tick' } as const, 0, {
   shape: 'tick-1',
 })
+// The latest Antigravity (Gemini) usage reading, refreshed by a timer.
+const agy = atom({ plugin: 'plan-progress', key: 'agy' } as const, null as AgyMeters | null, {
+  shape: 'agy-1',
+})
+// `agy -p /usage` takes about 10 seconds, so it is read on a timer, not per redraw.
+const AGY_POLL_MS = 5 * 60 * 1000
+
+// The Extraction pane: per-company progress of the LLM entity/relationship extraction.
+const EXT_PANE = 'extraction-progress'
+// Bumped on a timer so the pane follows the runner even when this chat is idle.
+const extTick = atom({ plugin: 'plan-progress', key: 'extTick' } as const, 0, {
+  shape: 'extTick-1',
+})
+const EXT_POLL_MS = 30 * 1000
+// The job store the extraction runner writes (relative to the project root).
+const JOBS_DB = 'data/state/extraction_jobs.sqlite'
+// All companies in the corpus (companies.csv); the job store only holds those added so far.
+const TOTAL_COMPANIES = 130
+// A failed item is retried until it has been tried this many times (jobs.py MAX_ATTEMPTS).
+const MAX_ATTEMPTS = 3
+// Display names for the job store's backend ids.
+const BACKENDS: Record<string, { name: string; color: string }> = {
+  groq: { name: 'Groq', color: '#ffa657' },
+  antigravity_cli: { name: 'Antigravity', color: '#79c0ff' },
+  claude_cli: { name: 'Sonnet', color: '#d2a8ff' },
+}
+
+// The fiscal years in the corpus, one box column each in the Filings grid.
+const YEARS = [2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
+const CORPUS = 'data/edgar-software-corpus'
+
+/**
+ * Shortens an SEC company name for the Filings grid, so more of it fits in a
+ * narrow pane: drops SEC state tags ("/DE/") and trailing legal or holding
+ * words ("Holdings, Inc.", "Corp", "plc", "N.V."), then turns names stored all
+ * in capitals into title case. "CrowdStrike Holdings, Inc." becomes
+ * "CrowdStrike"; "MICROSOFT CORP" becomes "Microsoft".
+ */
+function tidyName(name: string): string {
+  let s = name.replace(/\s*\/[A-Z]{2}\/?\s*$/, '').trim()
+  const suffix = /[\s,]+(inc\.?|corp\.?|corporation|co\.?|ltd\.?|plc|n\.v\.|holdings?)$/i
+  while (suffix.test(s)) s = s.replace(suffix, '').trim()
+  if (s !== s.toUpperCase()) return s
+  return s.toLowerCase().replace(/\b[a-z]/g, c => c.toUpperCase())
+}
+
+/**
+ * Reads which fiscal years each company filed a 10-K for, from manifest.csv.
+ *
+ * The Filings grid draws one box per filed year. The manifest is the project's
+ * authoritative filing list (one row per company-year), so a company with no
+ * 10-K in a year gets no box there. Also returns the companies in
+ * companies.csv rank order, so every company shows up even before it is queued.
+ */
+async function readFilings(
+  $: any,
+): Promise<{ order: string[]; names: Map<string, string>; filed: Map<string, Set<number>> } | null> {
+  try {
+    const filed = new Map<string, Set<number>>()
+    // cik,ticker,name,fiscal_year,... (name may be quoted and contain commas)
+    for (const line of (await $.fs.read(`${CORPUS}/manifest.csv`)).split('\n').slice(1)) {
+      const m = line.match(/^\d+,([^,]+),(?:"[^"]*"|[^,]*),(\d{4}),/)
+      if (!m || !m[1] || !m[2]) continue
+      if (!filed.has(m[1])) filed.set(m[1], new Set())
+      filed.get(m[1])!.add(Number(m[2]))
+    }
+    // rank,cik,ticker,name,... (name may be quoted and contain commas)
+    const order: string[] = []
+    const names = new Map<string, string>()
+    for (const line of (await $.fs.read(`${CORPUS}/companies.csv`)).split('\n').slice(1)) {
+      const m = line.match(/^\d+,\d+,([^,]+),(?:"([^"]*)"|([^,]*)),/)
+      if (!m || !m[1]) continue
+      order.push(m[1])
+      names.set(m[1], tidyName(m[2] ?? m[3] ?? ''))
+    }
+    return { order, names, filed }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Reads how far each company-year's extraction has got, keyed "PANW:2015":
+ * 'full' when every "extract" item of that year is finished (items out of
+ * retries count as finished), 'part' when some but not all are done.
+ *
+ * The Filings grid colours a year's box from this: bright green for full,
+ * dim green for part, grey for years with nothing done yet.
+ */
+async function readYearProgress($: any): Promise<Map<string, 'full' | 'part'>> {
+  const sql = `SELECT ticker || ':' || fiscal_year,
+      CASE WHEN SUM(status = 'done' OR (status = 'failed' AND attempts >= ${MAX_ATTEMPTS})) = COUNT(*)
+           THEN 'full' ELSE 'part' END
+    FROM items WHERE kind = 'extract'
+    GROUP BY ticker, fiscal_year HAVING SUM(status = 'done') > 0`
+  const out = new Map<string, 'full' | 'part'>()
+  try {
+    const r = await $.process.run(['/usr/bin/sqlite3', '-readonly', JOBS_DB, sql], { timeoutMs: 10000 })
+    if (r.exitCode !== 0) return out
+    for (const line of String(r.stdout).split('\n')) {
+      const [k, v] = line.split('|')
+      if (k && (v === 'full' || v === 'part')) out.set(k, v)
+    }
+  } catch {}
+  return out
+}
+
+// Box colour for a partly extracted year: a dimmer green than a finished one.
+const PART_GREEN = '#2f7d43'
+
+/** One company's extraction progress, as read from the job store. */
+type CompanyRow = {
+  seq: number
+  ticker: string
+  backend: string | null
+  total: number | null
+  done: number | null
+  running: number | null
+  stuck: number | null
+  y0: number | null
+  y1: number | null
+  last: string | null
+  /** Items of this company finished in the last ETA_WINDOW_MIN minutes: its recent pace. */
+  recent: number | null
+}
+
+// The ETA uses the pace of the last this many minutes ("at the current pace").
+const ETA_WINDOW_MIN = 60
+
+/**
+ * Reads per-company progress from the extraction job store.
+ *
+ * The Extraction pane draws from this. It counts "extract" items only (the ones
+ * that need an LLM call), the same way the pipeline's own status report does.
+ * The database is opened read-only, so the pane can never get in the runner's way.
+ * Returns null when the file is missing or unreadable.
+ */
+async function readCompanies($: any): Promise<CompanyRow[] | null> {
+  const sql = `SELECT c.seq, c.ticker, c.backend,
+      SUM(i.kind = 'extract') AS total,
+      SUM(i.kind = 'extract' AND i.status = 'done') AS done,
+      SUM(i.status = 'running') AS running,
+      SUM(i.kind = 'extract' AND i.status = 'failed' AND i.attempts >= ${MAX_ATTEMPTS}) AS stuck,
+      MIN(i.fiscal_year) AS y0, MAX(i.fiscal_year) AS y1, MAX(i.updated_at) AS last,
+      (SELECT COUNT(*) FROM results r JOIN items ri USING (item_id)
+        WHERE ri.ticker = c.ticker
+          AND r.created_at >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-${ETA_WINDOW_MIN} minutes')) AS recent
+    FROM companies c LEFT JOIN items i USING (ticker)
+    GROUP BY c.ticker ORDER BY c.seq`
+  try {
+    const r = await $.process.run(['/usr/bin/sqlite3', '-readonly', '-json', JOBS_DB, sql], { timeoutMs: 10000 })
+    if (r.exitCode !== 0) return null
+    const out = String(r.stdout).trim()
+    return out ? (JSON.parse(out) as CompanyRow[]) : []
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Reads Antigravity's Gemini 5-hour and weekly meters from `agy -p /usage`.
+ *
+ * The panel shows these next to Claude's meters so the user can see how much of
+ * each extraction backend's quota is left. `agy` prints tab-separated lines with
+ * the % *remaining*; this returns % used, like Claude's. Returns null when the
+ * command fails or its output is not understood, so the panel shows a dash.
+ */
+async function readAgy($: any): Promise<AgyMeters | null> {
+  try {
+    // An empty folder, so `agy` picks up no project files.
+    const r = await $.process.run(['agy', '-p', '/usage'], { cwd: '/private/tmp', timeoutMs: 60000 })
+    const found: Record<string, Meter> = {}
+    for (const line of String(r.stdout).split('\n')) {
+      const p = line.split('\t').map(x => x.trim())
+      if (p.length === 4 && p[0] === 'Gemini Models' && p[1] && p[2]) {
+        found[p[1]] = { percentUsed: 100 - parseFloat(p[2]), resetsAt: p[3] }
+      }
+    }
+    const fiveHour = found['Five Hour Limit Remaining']
+    const sevenDay = found['Weekly Limit Remaining']
+    return fiveHour && sevenDay ? { fiveHour, sevenDay } : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Takes a fresh Antigravity reading and stores it, keeping the last good one if
+ * the read fails, so a flaky `agy` call doesn't blank the bars.
+ */
+async function pollAgy($: any) {
+  const m = await readAgy($)
+  if (m) await update($, agy, () => m)
+}
 
 
 // Colours used by the panel. Fixed hex values so the look is the same in any
@@ -78,12 +274,257 @@ export const register: Register = on => {
       description: 'Open the PLAN.md progress panel',
     })
     void $.ui.open({ id: PANE, title: 'Project progress' })
+    void pollAgy($)
+    $.clock.every(AGY_POLL_MS, () => pollAgy($))
+    await $.command.register({
+      name: 'extraction',
+      description: 'Open the per-company extraction progress panel',
+    })
+    void $.ui.open({ id: EXT_PANE, title: 'Extraction' })
+    $.clock.every(EXT_POLL_MS, () => update($, extTick, n => n + 1))
     return next(e)
   })
 
   on('command.run', { command: 'progress' }, async $ => {
     await $.ui.open({ id: PANE, title: 'Project progress' })
     return { text: 'Progress panel opened.' }
+  })
+
+  on('command.run', { command: 'extraction' }, async $ => {
+    await $.ui.open({ id: EXT_PANE, title: 'Extraction' })
+    return { text: 'Extraction panel opened.' }
+  })
+
+  // The Extraction pane: how many companies are done, and live detail for the
+  // ones being extracted now (backend, % done, years, last activity).
+  on('ui.render', { component: 'Pane', requestId: EXT_PANE }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    await read($, tick)
+    await read($, extTick)
+    const w = (e.viewport?.columns ?? 44) - 10
+    const now = await $.clock.now()
+
+    const rows = await readCompanies($)
+    const filings = await readFilings($)
+    const yearProgress = await readYearProgress($)
+    // Usage meters for the compact LLM usage card: the same sources as the
+    // progress pane (Groq's daily budget file, Claude's session limits, agy).
+    const agyMeters = await read($, agy)
+    const today = new Date(now).toISOString().slice(0, 10)
+    const groq = await budget($, 'budget_groq.json', today)
+    const limits: { kind: string; percentUsed: number; resetsAt?: string }[] = await $.session
+      .usage()
+      .then((u: any) => u.rateLimits ?? [])
+      .catch(() => [])
+    if (rows === null) {
+      return <Text color={C.muted}>No extraction job store yet ({JOBS_DB}).</Text>
+    }
+
+    // "left" = items still to do; stuck items (out of retries) don't count as left.
+    const left = (r: CompanyRow) => (r.total ?? 0) - (r.done ?? 0) - (r.stuck ?? 0)
+    const finished = rows.filter(r => (r.total ?? 0) > 0 && left(r) === 0)
+    const active = rows.filter(r => r.backend && left(r) > 0)
+    const queued = rows.filter(r => !r.backend && !finished.includes(r))
+    const notAdded = Math.max(0, TOTAL_COMPANIES - rows.length)
+    const itemsDone = rows.reduce((s, r) => s + (r.done ?? 0), 0)
+    const itemsTotal = rows.reduce((s, r) => s + (r.total ?? 0), 0)
+
+    // ETA at the current pace: items left ÷ items finished in the last
+    // ETA_WINDOW_MIN minutes. null when there is no recent pace to go on (a
+    // company just claimed, or its backend paused by a quota).
+    const dur = (mins: number) => {
+      const m = Math.max(1, Math.round(mins))
+      const d = Math.floor(m / 1440)
+      const h = Math.floor((m % 1440) / 60)
+      return d ? `${d}d ${h}h` : h ? `${h}h ${m % 60}m` : `${m}m`
+    }
+    const eta = (itemsLeft: number, recent: number) =>
+      itemsLeft > 0 && recent > 0 ? (itemsLeft / recent) * ETA_WINDOW_MIN : null
+    const itemsLeft = rows.reduce((s, r) => s + Math.max(0, left(r)), 0)
+    const waveEta = eta(itemsLeft, rows.reduce((s, r) => s + (r.recent ?? 0), 0))
+
+    const bar = (ratio: number, width: number, color: string) => {
+      const f = Math.round(Math.min(1, Math.max(0, ratio)) * width)
+      return (
+        <Text color={color}>
+          {'█'.repeat(f)}
+          <Text color={C.track}>{'░'.repeat(width - f)}</Text>
+        </Text>
+      )
+    }
+    const card = (title: string, accent: string, body: any) => (
+      <Box flexDirection="column" borderStyle="round" borderColor={C.border} paddingX={1}>
+        <Text bold color={accent}>
+          {title}
+        </Text>
+        <Box flexDirection="column">{body}</Box>
+      </Box>
+    )
+    const backendOf = (id: string | null) =>
+      (id && BACKENDS[id]) || { name: id ?? '—', color: C.muted }
+    const years = (r: CompanyRow) =>
+      r.y0 == null ? '' : r.y0 === r.y1 ? `FY${r.y0}` : `FY${r.y0}–${String(r.y1).slice(2)}`
+    const ago = (iso: string | null) => {
+      if (!iso) return '—'
+      const m = Math.max(0, Math.round((now - Date.parse(iso)) / 60000))
+      return m < 60 ? `${m}m ago` : m < 1440 ? `${Math.floor(m / 60)}h ago` : `${Math.floor(m / 1440)}d ago`
+    }
+    // "2h 14m" until an ISO time.
+    const until = (iso?: string) => {
+      if (!iso) return ''
+      const m = Math.max(0, Math.round((Date.parse(iso) - now) / 60000))
+      const d = Math.floor(m / 1440)
+      const h = Math.floor((m % 1440) / 60)
+      return d ? `${d}d ${h}h` : h ? `${h}h ${m % 60}m` : `${m}m`
+    }
+    // One compact usage line: label, % used (red above 80%), then a muted detail.
+    const usageLine = (label: string, pct: number | null, detail: string) => (
+      <Text color={C.text}>
+        {label.padEnd(15)}
+        <Text bold color={pct !== null && pct > 80 ? C.warn : C.blue}>
+          {pct === null ? '—' : `${Math.round(pct)}%`.padStart(4)}
+        </Text>
+        <Text color={C.muted}>{detail ? clip(`  ${detail}`, Math.max(0, w - 19)) : ''}</Text>
+      </Text>
+    )
+    const windowLine = (label: string, l?: Meter) =>
+      usageLine(label, l ? l.percentUsed : null, l?.resetsAt ? `resets ${until(l.resetsAt)}` : '')
+    // Filings grid order: queued companies first (extraction priority), then the
+    // rest of the corpus by companies.csv rank.
+    const gridOrder = filings
+      ? [...rows.map(r => r.ticker), ...filings.order.filter(t => !rows.some(r => r.ticker === t))]
+      : []
+    const tickW = Math.max(4, ...gridOrder.map(t => t.length)) + 1
+    // One grid row: ticker, then a box per year (bright green = extracted, dim
+    // green = partly, grey = not yet, blank = no 10-K that year), then the
+    // company's name. The terminal cuts the row at the pane's real edge (with
+    // "…"), so a long name never wraps onto the next row.
+    const boxColor = (t: string, y: number) => {
+      const p = yearProgress.get(`${t}:${y}`)
+      return p === 'full' ? C.done : p === 'part' ? PART_GREEN : C.track
+    }
+    const gridRow = (t: string) => (
+      <Text color={C.text} wrap="truncate-end">
+        {t.padEnd(tickW)}
+        {YEARS.map(y =>
+          !filings?.filed.get(t)?.has(y) ? '  ' : <Text color={boxColor(t, y)}>■ </Text>,
+        )}
+        <Text color={C.muted}> {filings?.names.get(t) ?? ''}</Text>
+      </Text>
+    )
+    const tickers = (list: CompanyRow[]) => (
+      <Text color={C.text}>
+        {list.map((r, i) => (
+          <Text>
+            {i ? ' · ' : ''}
+            {r.ticker}
+            <Text color={backendOf(r.backend).color}> {backendOf(r.backend).name}</Text>
+          </Text>
+        ))}
+      </Text>
+    )
+
+    return (
+      <Box flexDirection="column">
+        {card(
+          'Companies',
+          C.blue,
+          <Box flexDirection="column">
+            <Text bold color={C.text}>
+              {finished.length} / {TOTAL_COMPANIES} caught up
+              <Text color={C.muted}> · {Math.round((finished.length / TOTAL_COMPANIES) * 100)}%</Text>
+            </Text>
+            {bar(finished.length / TOTAL_COMPANIES, Math.min(30, w), C.done)}
+            <Text color={C.muted}>
+              <Text color={C.current}>◐ {active.length}</Text> in progress · ○ {queued.length} queued ·{' '}
+              {notAdded} not added
+            </Text>
+            <Text color={C.muted}>
+              Items {itemsDone.toLocaleString()} / {itemsTotal.toLocaleString()}
+              {itemsTotal ? ` (${Math.round((itemsDone / itemsTotal) * 100)}%)` : ''}
+            </Text>
+            {itemsLeft > 0 && (
+              <Text color={C.muted}>
+                Wave ETA{' '}
+                <Text bold color={C.text}>
+                  {waveEta === null ? '—' : `~${dur(waveEta)}`}
+                </Text>
+                {waveEta === null ? ' (no items finished in the last hour)' : ' at last hour’s pace'}
+              </Text>
+            )}
+          </Box>,
+        )}
+
+        {active.length > 0 &&
+          card(
+            'In progress',
+            C.current,
+            <Box flexDirection="column" gap={1}>
+              {active.map(r => {
+                const b = backendOf(r.backend)
+                const pct = r.total ? (r.done ?? 0) / r.total : 0
+                const rowEta = eta(left(r), r.recent ?? 0)
+                return (
+                  <Box flexDirection="column">
+                    <Text color={C.text}>
+                      <Text bold>{r.ticker}</Text> <Text color={b.color}>{b.name}</Text>{' '}
+                      <Text color={C.muted}>{Math.round(pct * 100)}%</Text>
+                      <Text color={C.muted}> · {rowEta === null ? 'ETA —' : `~${dur(rowEta)} left`}</Text>
+                    </Text>
+                    {bar(pct, Math.min(24, w), b.color)}
+                    <Text color={C.muted}>
+                      {clip(
+                        `${r.done ?? 0}/${r.total ?? 0} items · ${years(r)}` +
+                          (r.running ? ` · ${r.running} running` : '') +
+                          (r.stuck ? ` · ${r.stuck} stuck` : '') +
+                          ` · ${ago(r.last)}`,
+                        w,
+                      )}
+                    </Text>
+                  </Box>
+                )
+              })}
+            </Box>,
+          )}
+
+        {finished.length > 0 && card('Caught up', C.done, tickers(finished))}
+
+        {card(
+          'LLM usage',
+          C.current,
+          <Box flexDirection="column">
+            {usageLine(
+              'Groq today',
+              groq === null ? null : (groq / 200000) * 100,
+              groq === null ? '' : `${Math.round(groq / 1000)}K / 200K`,
+            )}
+            {windowLine('Claude 5h', limits.find(x => x.kind === 'five_hour'))}
+            {windowLine('Claude 7d', limits.find(x => x.kind === 'seven_day'))}
+            {windowLine('Antigravity 5h', agyMeters?.fiveHour)}
+            {windowLine('Antigravity 7d', agyMeters?.sevenDay)}
+          </Box>,
+        )}
+
+        {filings &&
+          card(
+            'Filings',
+            C.done,
+            <Box flexDirection="column">
+              <Text color={C.muted}>
+                {' '.repeat(tickW)}
+                {YEARS.map(y => String(y % 10) + ' ')}
+              </Text>
+              {gridOrder.map(gridRow)}
+              <Text color={C.muted}>
+                <Text color={C.done}>■</Text> extracted <Text color={PART_GREEN}>■</Text> partly{' '}
+                <Text color={C.track}>■</Text> not yet · FY2015–24
+              </Text>
+            </Box>,
+          )}
+
+        {queued.length > 0 && card('Queued', C.muted, tickers(queued))}
+      </Box>
+    )
   })
 
   on('tool.call', async ($, e, next) => {
@@ -95,6 +536,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     await read($, tick)
+    const agyMeters = await read($, agy)
     const cols = (e.viewport?.columns ?? 44) - 6
     const rowsAvail = e.viewport?.rows ?? 40
 
@@ -192,8 +634,8 @@ export const register: Register = on => {
       const h = Math.floor((mins % 1440) / 60)
       return ' · resets in ' + (d ? `${d}d ${h}h` : h ? `${h}h ${mins % 60}m` : `${mins}m`)
     }
-    const windowRow = (label: string, kind: string) => {
-      const l = limits.find(x => x.kind === kind)
+    // One usage window: label, "% · resets in …", and a bar (red above 80%).
+    const windowRow = (label: string, l?: Meter) => {
       return (
         <Box flexDirection="column">
           <Text color={C.text}>
@@ -306,8 +748,10 @@ export const register: Register = on => {
           C.current,
           <Box flexDirection="column" gap={1}>
             {budgetRow('Groq (today)', groq, 200000)}
-            {windowRow('Claude 5-hour', 'five_hour')}
-            {windowRow('Claude 7-day', 'seven_day')}
+            {windowRow('Claude 5-hour', limits.find(x => x.kind === 'five_hour'))}
+            {windowRow('Claude 7-day', limits.find(x => x.kind === 'seven_day'))}
+            {windowRow('Antigravity 5-hour', agyMeters?.fiveHour)}
+            {windowRow('Antigravity 7-day', agyMeters?.sevenDay)}
           </Box>,
         )}
       </Box>

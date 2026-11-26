@@ -41,7 +41,12 @@ ENTITY_TYPES: dict[str, str] = {
 # --------------------------------------------------------------------------------------
 RELATION_TYPES: dict[str, str] = {
     "COMPETES_WITH": "The subject company names the object company as a competitor.",
-    "HAS_SUPPLIER": "The object company supplies products, components or services to the subject.",
+    "HAS_SUPPLIER": "The object company provides something the subject itself uses: components, "
+                    "manufacturing, or services such as data centers or cloud hosting for the "
+                    "subject's own platform (e.g. 'we host our platform on AWS').",
+    "INTEGRATES_WITH": "The subject company's products run on, are deployed on or integrate with "
+                       "the object company's platform or products for customers (e.g. 'our firewall "
+                       "can be deployed on VMware ESXi'). Not a supplier.",
     "HAS_CUSTOMER": "The object company is a customer of the subject.",
     "PARTNERS_WITH": "The two companies have a partnership, alliance or joint offering.",
     "ACQUIRED": "The subject company acquired (or agreed to acquire) the object company.",
@@ -61,6 +66,7 @@ RELATION_TYPES: dict[str, str] = {
 VALIDATION_SCHEMA: list[tuple[str, str, str]] = [
     ("Company", "COMPETES_WITH", "Company"),
     ("Company", "HAS_SUPPLIER", "Company"),
+    ("Company", "INTEGRATES_WITH", "Company"),
     ("Company", "HAS_CUSTOMER", "Company"),
     ("Company", "PARTNERS_WITH", "Company"),
     ("Company", "ACQUIRED", "Company"),
@@ -93,6 +99,10 @@ RISK_CATEGORIES: dict[str, str] = {
     "customers_demand": "Customer concentration, demand, sales cycles, renewals.",
     "intellectual_property": "Protecting own IP, infringement claims, open source.",
     "talent": "Hiring and keeping key people and skilled staff.",
+    "growth_scaling": "Managing rapid growth, scaling operations, limited operating history, "
+                      "keeping up past growth rates.",
+    "brand_reputation": "Building and protecting the brand and reputation, public perception, "
+                        "misuse of products harming reputation.",
     "strategic_transactions": "Acquisitions, divestitures, integration, partnerships.",
     "esg_climate": "Environmental, social and governance expectations, climate regulation.",
     "stock_governance": "Share price volatility, internal controls, anti-takeover provisions.",
@@ -114,12 +124,20 @@ FACT_PROPERTIES: dict[str, str] = {
     "fiscal_year": "Fiscal year of the filing the fact comes from.",
     "ticker": "Ticker of the filing company.",
     "chunk_ids": "IDs of the chunks in that filing that state the fact.",
+    "evidence": "The supporting quote from each chunk, in the same order as chunk_ids "
+                "(for a risk: the risk-factor title).",
+    "verified": "True if at least one chunk's quote and named entities were found in the chunk "
+                "text; False marks a fact the model may have invented or reworded.",
     "schema_version": "SCHEMA_VERSION used when the fact was extracted.",
 }
 
+# Link from a Chunk to every entity its extracted facts name, so retrieval can go from a
+# chunk found by vector search straight to its entities (LlamaIndex's own convention).
+MENTIONS_RELATION = "MENTIONS"
+
 # Raise this whenever the lists above change, so facts from an older schema can be found
 # and re-extracted selectively instead of re-running the whole corpus.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 
 def check_schema() -> None:

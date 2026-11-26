@@ -26,6 +26,7 @@ for the production ingestion pipeline):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -72,20 +73,52 @@ class DailyTokenBudget:
 
     The count is saved in a small JSON file, so it survives restarts. This protects the free
     daily quota: a crash or a rerun can never use up more tokens than allowed.
+
+    Quotas belong to an account (an API key), not to a backend. With `account` (a short
+    fingerprint of the key, never the key itself), `budget_<backend>.json` always holds the
+    active account's count and names its account. When the key changes, the other account's
+    count is moved aside to `budget_<backend>_<account>.json` and the active account's own
+    earlier count, if any, is restored. So switching keys never mixes two accounts' usage,
+    and tools that read `budget_<backend>.json` keep working.
     """
 
-    def __init__(self, backend: str, daily_limit: int):
+    def __init__(self, backend: str, daily_limit: int, account: str | None = None):
+        """Create the counter for `backend`, optionally for one account (key fingerprint)."""
         self.backend = backend
         self.daily_limit = daily_limit
+        self.account = account
         self.path = STATE_DIR / f"budget_{backend}.json"
+
+    def _fresh(self) -> dict:
+        """A zero count for today (for this account, if accounts are tracked)."""
+        data = {"date": date.today().isoformat(), "tokens_used": 0, "requests": 0}
+        return {**data, "account": self.account} if self.account else data
+
+    def _switch_account(self, data: dict) -> dict:
+        """The file holds another account's count: park it, and return this account's own saved count."""
+        parked = STATE_DIR / f"budget_{self.backend}_{data.get('account') or 'unknown'}.json"
+        parked.write_text(json.dumps(data))
+        mine = STATE_DIR / f"budget_{self.backend}_{self.account}.json"
+        own = json.loads(mine.read_text()) if mine.exists() else self._fresh()
+        self._save(own)
+        return own
+
+    def _save(self, data: dict) -> None:
+        """Write the counters atomically (the replace means the file is never half-written)."""
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(self.path)
 
     def _load(self) -> dict:
         """Read today's counters from the file; start from zero on a new day or a missing file."""
         if self.path.exists():
             data = json.loads(self.path.read_text())
+            if self.account and data.get("account") != self.account:
+                data = self._switch_account(data)
             if data.get("date") == date.today().isoformat():
                 return data
-        return {"date": date.today().isoformat(), "tokens_used": 0, "requests": 0}
+        return self._fresh()
 
     def used_today(self) -> int:
         """Return how many tokens this backend has used today."""
@@ -105,10 +138,7 @@ class DailyTokenBudget:
         data = self._load()
         data["tokens_used"] += tokens
         data["requests"] += 1
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data))
-        tmp.replace(self.path)  # the replace is atomic, so the file is never half-written
+        self._save(data)
 
 
 class RequestPacer:
@@ -202,9 +232,10 @@ class LLMProvider(ABC):
     backend: str
 
     def __init__(self, model: str, daily_token_limit: int, requests_per_minute: int,
-                 tokens_per_minute: int | None = None):
+                 tokens_per_minute: int | None = None, account: str | None = None):
+        """Set up the guards. `account` is a fingerprint of the API key, so the daily budget is per account."""
         self.model = model
-        self.budget = DailyTokenBudget(self.backend, daily_token_limit)
+        self.budget = DailyTokenBudget(self.backend, daily_token_limit, account)
         self.pacer = RequestPacer(requests_per_minute)
         self.tpm = TokenRateLimiter(tokens_per_minute) if tokens_per_minute else None
 
@@ -252,6 +283,8 @@ class GroqProvider(LLMProvider):
             daily_token_limit=int(os.getenv("GROQ_DAILY_TOKENS", "200000")),
             requests_per_minute=int(os.getenv("GROQ_RPM", "30")),
             tokens_per_minute=int(os.getenv("GROQ_TPM", "8000")),
+            # Groq's limits are per account: count each API key separately (fingerprint only).
+            account=hashlib.sha256(os.environ["GROQ_API_KEY"].encode()).hexdigest()[:8],
         )
         self.client = OpenAI(
             api_key=os.environ["GROQ_API_KEY"],
