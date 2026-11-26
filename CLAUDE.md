@@ -48,7 +48,7 @@ than speed.
 | Embeddings | **Local model** (e.g. BAAI/bge family) on the M3 | Free and unlimited; self-hosted embeddings are common in production |
 | LLM access | **Swappable LLM backend** behind one interface | Production code shouldn't depend on one vendor |
 | ↳ backend A | `openai/gpt-oss-120b` on **Groq** (free tier, OpenAI-compatible API) | The "real" production path |
-| ↳ backend B | Claude via `claude -p` (Claude Code headless, $20 Pro plan) | **Workaround** for free-API limits. Keep it clearly labeled as a workaround in code |
+| ↳ backend B | Claude **Sonnet** via `claude -p` (Claude Code headless, $20 Pro plan) | **Workaround** for free-API limits. Keep it clearly labeled as a workaround in code. Sonnet, not Haiku: extraction quality should be close to gpt-oss-120b |
 | Scope | Pipeline built for the **full corpus**, run in waves until everything is done | Shows how production ingestion works: resumable, budgeted, idempotent |
 | Interface | **FastAPI** service | How it would be deployed |
 | Version control | **git**, one commit per completed step (only when the user says to commit) | So each step can be reviewed later |

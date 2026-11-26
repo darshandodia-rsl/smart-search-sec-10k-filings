@@ -298,7 +298,7 @@ class ClaudeCLIProvider(LLMProvider):
     def __init__(self):
         """Read the settings from the environment (model, daily cap, requests per minute)."""
         super().__init__(
-            model=os.getenv("CLAUDE_MODEL", "haiku"),
+            model=os.getenv("CLAUDE_MODEL", "sonnet"),  # Sonnet: extraction quality close to gpt-oss-120b
             # Pro-plan limits are per 5-hour window and are not published as token numbers,
             # so this daily cap is our own choice, to be tuned from real usage.
             daily_token_limit=int(os.getenv("CLAUDE_DAILY_TOKENS", "2000000")),

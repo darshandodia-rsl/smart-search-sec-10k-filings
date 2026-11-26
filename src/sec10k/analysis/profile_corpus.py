@@ -268,8 +268,9 @@ def report_repetition(rep: pd.DataFrame) -> None:
 # MEASURED on one 3K-token sample of 10-K text through sec10k/llm/providers.py (2026-11-24):
 GROQ_TOKEN_RATIO = 1.00      # Groq prompt tokens divided by o200k_harmony tokens
 GROQ_CALL_OVERHEAD = 84      # fixed chat-format tokens added to every call
-CLAUDE_TOKEN_RATIO = 1.62    # Claude Haiku input tokens divided by o200k_harmony tokens (from a single sample)
-CLAUDE_CALL_OVERHEAD = 621   # fixed input tokens of every `claude -p` call, with our minimal flags
+# MEASURED with Claude Sonnet (claude-sonnet-5-5) on one 3.3K-token MSFT FY2023 Item 1A sample (2026-11-26):
+CLAUDE_TOKEN_RATIO = 1.64    # Claude Sonnet input tokens divided by o200k_harmony tokens (from a single sample)
+CLAUDE_CALL_OVERHEAD = 598   # fixed input tokens of every `claude -p` call, with our minimal flags
 # ASSUMED values, to be replaced by measurements from the extraction prototype:
 CONTENT_PER_CALL = 4_000     # tokens of filing text per request (fits Groq's 8K tokens/minute limit)
 PROMPT_TOKENS = 1_000        # extraction instructions + schema per request
