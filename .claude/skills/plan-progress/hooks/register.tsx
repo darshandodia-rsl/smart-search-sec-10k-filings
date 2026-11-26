@@ -105,7 +105,7 @@ async function readYearProgress($: any): Promise<Map<string, 'full' | 'part'>> {
     GROUP BY ticker, fiscal_year HAVING SUM(status = 'done') > 0`
   const out = new Map<string, 'full' | 'part'>()
   try {
-    const r = await $.process.run(['/usr/bin/sqlite3', '-readonly', JOBS_DB, sql], { timeoutMs: 10000 })
+    const r = await $.process.run(['/usr/bin/sqlite3', JOBS_DB, sql], { timeoutMs: 10000 })
     if (r.exitCode !== 0) return out
     for (const line of String(r.stdout).split('\n')) {
       const [k, v] = line.split('|')
@@ -113,6 +113,79 @@ async function readYearProgress($: any): Promise<Map<string, 'full' | 'part'>> {
     }
   } catch {}
   return out
+}
+
+// The runner's events file (one JSON object per line); `run_stopped` marks the end of a run.
+const EVENTS_FILE = 'data/logs/extraction_events.jsonl'
+
+/** The most recent finished extraction run, taken from the events file. */
+type LastRun = {
+  /** ISO time the run stopped. */
+  endedAt: string
+  /** ISO time the run started, or null if its start is no longer in the file's tail. */
+  startedAt: string | null
+  /** The runner's own end-of-run summary, one entry per line. */
+  lines: string[]
+}
+
+// Pid files of the two runners (written by the run skills); each holds a caffeinate PID that
+// lives exactly as long as its runner.
+const RUNNER_PIDS = ['data/state/extraction_runner_main.pid', 'data/state/extraction_runner_sonnet.pid']
+
+/**
+ * Tells whether any extraction runner (main or Sonnet) is alive right now.
+ *
+ * The "Last run" card only makes sense between runs, so the pane hides it while this is
+ * true. The two runners start and stop independently, so event order alone cannot say
+ * whether one is still going; the pid files can.
+ */
+async function runnerActive($: any): Promise<boolean> {
+  const pids: string[] = []
+  for (const f of RUNNER_PIDS) {
+    try {
+      const p = (await $.fs.read(f)).trim()
+      if (/^\d+$/.test(p)) pids.push(p)
+    } catch {} // no pid file: that runner was never started
+  }
+  if (pids.length === 0) return false
+  try {
+    const r = await $.process.run(['/bin/ps', '-p', pids.join(','), '-o', 'pid='], { timeoutMs: 5000 })
+    return String(r.stdout).trim().length > 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Finds the latest `run_stopped` event and the `run_started` event before it.
+ *
+ * The Extraction pane's "Last run" card shows this, so the summary of a finished
+ * wave stays visible after the runner has exited. Only the tail of the events
+ * file is read, as the file grows for as long as the project runs. Returns null
+ * when no run has stopped yet or the file cannot be read.
+ */
+async function readLastRun($: any): Promise<LastRun | null> {
+  try {
+    const r = await $.process.run(['/usr/bin/tail', '-c', '100000', EVENTS_FILE], { timeoutMs: 10000 })
+    if (r.exitCode !== 0) return null
+    const events: { at: string; kind: string; message?: string }[] = []
+    for (const line of String(r.stdout).split('\n')) {
+      try {
+        events.push(JSON.parse(line))
+      } catch {} // a blank line, or the line cut in half by tail
+    }
+    const stopIdx = events.map(x => x.kind).lastIndexOf('run_stopped')
+    const stop = events[stopIdx]
+    if (!stop) return null
+    const start = events.slice(0, stopIdx).reverse().find(x => x.kind === 'run_started')
+    return {
+      endedAt: stop.at,
+      startedAt: start?.at ?? null,
+      lines: String(stop.message ?? '').split('\n').filter(l => l.trim()),
+    }
+  } catch {
+    return null
+  }
 }
 
 // Box colour for a partly extracted year: a dimmer green than a finished one.
@@ -144,7 +217,8 @@ const ETA_WINDOW_MIN = 60
  *
  * The Extraction pane draws from this. It counts "extract" items only (the ones
  * that need an LLM call), the same way the pipeline's own status report does.
- * The database is opened read-only, so the pane can never get in the runner's way.
+ * The pane only runs SELECTs, and the job store is in WAL mode (readers never block the
+ * runner). It is not opened with `-readonly`: that flag fails when no runner is active.
  * Returns null when the file is missing or unreadable.
  */
 async function readCompanies($: any): Promise<CompanyRow[] | null> {
@@ -160,7 +234,7 @@ async function readCompanies($: any): Promise<CompanyRow[] | null> {
     FROM companies c LEFT JOIN items i USING (ticker)
     GROUP BY c.ticker ORDER BY c.seq`
   try {
-    const r = await $.process.run(['/usr/bin/sqlite3', '-readonly', '-json', JOBS_DB, sql], { timeoutMs: 10000 })
+    const r = await $.process.run(['/usr/bin/sqlite3', '-json', JOBS_DB, sql], { timeoutMs: 10000 })
     if (r.exitCode !== 0) return null
     const out = String(r.stdout).trim()
     return out ? (JSON.parse(out) as CompanyRow[]) : []
@@ -309,6 +383,8 @@ export const register: Register = on => {
     const rows = await readCompanies($)
     const filings = await readFilings($)
     const yearProgress = await readYearProgress($)
+    const running = await runnerActive($)
+    const lastRun = running ? null : await readLastRun($)
     // Usage meters for the compact LLM usage card: the same sources as the
     // progress pane (Groq's daily budget file, Claude's session limits, agy).
     const agyMeters = await read($, agy)
@@ -490,7 +566,8 @@ export const register: Register = on => {
           </Box>,
         )}
 
-        {active.length > 0 &&
+        {running &&
+          active.length > 0 &&
           card(
             'In progress',
             C.current,
@@ -525,6 +602,28 @@ export const register: Register = on => {
         {finished.length > 0 && card('Caught up', C.done, tickers(finished))}
 
         {queued.length > 0 && card('Queued', C.muted, tickers(queued))}
+
+        {lastRun &&
+          card(
+            'Last run',
+            C.more,
+            <Box flexDirection="column">
+              <Text color={C.text}>
+                Ended {ago(lastRun.endedAt)}
+                {lastRun.startedAt && (
+                  <Text color={C.muted}>
+                    {' '}
+                    · took {dur((Date.parse(lastRun.endedAt) - Date.parse(lastRun.startedAt)) / 60000)}
+                  </Text>
+                )}
+              </Text>
+              {lastRun.lines.map(l => (
+                <Text color={C.muted} wrap="truncate-end">
+                  {l}
+                </Text>
+              ))}
+            </Box>,
+          )}
 
         {card(
           'LLM usage',

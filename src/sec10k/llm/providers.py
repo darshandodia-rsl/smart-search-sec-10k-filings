@@ -21,7 +21,9 @@ for the production ingestion pipeline):
   - tokens per minute     -> waits until the last 60 seconds have room for the next call
                              (only for backends with a per-minute token limit, i.e. Groq)
   - daily token budget    -> refuses to call once today's tokens would pass the limit; the
-                             count is saved to a JSON file so it survives restarts
+                             count is saved to a JSON file so it survives restarts. Groq's
+                             budget is a bucket that refills steadily instead of a calendar-day
+                             count, because that is how Groq itself applies its daily limit
 """
 
 from __future__ import annotations
@@ -82,6 +84,8 @@ class DailyTokenBudget:
     and tools that read `budget_<backend>.json` keep working.
     """
 
+    period = "today"  # how messages describe the counting period
+
     def __init__(self, backend: str, daily_limit: int, account: str | None = None):
         """Create the counter for `backend`, optionally for one account (key fingerprint)."""
         self.backend = backend
@@ -129,8 +133,8 @@ class DailyTokenBudget:
         used = self.used_today()
         if used + estimated_tokens > self.daily_limit:
             raise BudgetExceeded(
-                f"{self.backend}: {used:,} tokens used today + ~{estimated_tokens:,} estimated "
-                f"> daily limit {self.daily_limit:,}"
+                f"{self.backend}: {used:,} tokens used {self.period} + ~{estimated_tokens:,} "
+                f"estimated > daily limit {self.daily_limit:,}"
             )
 
     def record(self, tokens: int) -> None:
@@ -138,6 +142,60 @@ class DailyTokenBudget:
         data = self._load()
         data["tokens_used"] += tokens
         data["requests"] += 1
+        self._save(data)
+
+
+class TokenBucketBudget(DailyTokenBudget):
+    """A daily token budget that refills steadily, the way Groq's tokens-per-day limit works.
+
+    Think of a bucket that holds the daily limit (200K tokens for Groq's free tier). Each call
+    takes its tokens out; the bucket refills at the daily limit per 24 hours (about 8.3K an
+    hour), never above full. Groq applies its limit this way, so a counter that restarts at
+    midnight, or one that waits for calls to be a full day old, would disagree with Groq:
+    the first lets calls through that Groq refuses, the second blocks calls Groq would accept.
+
+    The file stores the bucket's level and when it was last updated; the current level is
+    worked out from the time passed since. `used_today()` reports the empty part of the bucket,
+    so the router and the providers use it exactly like a `DailyTokenBudget`.
+    """
+
+    REFILL_SECONDS = 24 * 3600.0  # time to refill an empty bucket completely
+    period = "(refilling bucket)"
+
+    def _fresh(self) -> dict:
+        """A full bucket (for this account, if accounts are tracked)."""
+        data = {"level": float(self.daily_limit), "updated": time.time()}
+        return {**data, "account": self.account} if self.account else data
+
+    def _load(self) -> dict:
+        """Read the bucket and refill it for the time passed since it was last saved.
+
+        A file in another format (such as a calendar-day count) starts as a full bucket.
+        """
+        if self.path.exists():
+            data = json.loads(self.path.read_text())
+            if self.account and data.get("account") != self.account:
+                data = self._switch_account(data)
+            if "level" in data:
+                now = time.time()
+                refill = (now - data["updated"]) * self.daily_limit / self.REFILL_SECONDS
+                data["level"] = min(float(self.daily_limit), data["level"] + refill)
+                data["updated"] = now
+                return data
+        return self._fresh()
+
+    def used_today(self) -> int:
+        """Return the tokens missing from a full bucket (what Groq would call "used")."""
+        return round(self.daily_limit - self._load()["level"])
+
+    def record(self, tokens: int) -> None:
+        """Take a finished call's tokens out of the bucket and save it.
+
+        The level may go slightly below zero when a call used more than estimated; it then
+        refills from there, as Groq's own count does.
+        """
+        data = self._load()
+        data["level"] -= tokens
         self._save(data)
 
 
@@ -230,12 +288,13 @@ class LLMProvider(ABC):
     """
 
     backend: str
+    budget_class: type[DailyTokenBudget] = DailyTokenBudget  # how the daily budget is counted
 
     def __init__(self, model: str, daily_token_limit: int, requests_per_minute: int,
                  tokens_per_minute: int | None = None, account: str | None = None):
         """Set up the guards. `account` is a fingerprint of the API key, so the daily budget is per account."""
         self.model = model
-        self.budget = DailyTokenBudget(self.backend, daily_token_limit, account)
+        self.budget = self.budget_class(self.backend, daily_token_limit, account)
         self.pacer = RequestPacer(requests_per_minute)
         self.tpm = TokenRateLimiter(tokens_per_minute) if tokens_per_minute else None
 
@@ -269,10 +328,12 @@ class GroqProvider(LLMProvider):
     """Calls openai/gpt-oss-120b on Groq through its OpenAI-compatible API (free tier).
 
     Limits come from environment variables and default to the free tier's: 30 requests a
-    minute, 8K tokens a minute and 200K tokens a day.
+    minute, 8K tokens a minute and 200K tokens a day. Groq refills the daily tokens steadily
+    (200K per 24 hours), so this backend uses a `TokenBucketBudget`.
     """
 
     backend = "groq"
+    budget_class = TokenBucketBudget
 
     def __init__(self):
         """Read the settings from the environment and create the API client."""
