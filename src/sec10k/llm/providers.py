@@ -1,11 +1,13 @@
 """One common way to call an LLM, with swappable backends.
 
-What it does: defines `LLMProvider`, a class with a single `complete(prompt)` call, and two
+What it does: defines `LLMProvider`, a class with a single `complete(prompt)` call, and three
 backends that implement it:
-  - GroqProvider       the "real" production path (openai/gpt-oss-120b over Groq's
-                       OpenAI-compatible API, free tier)
-  - ClaudeCLIProvider  a WORKAROUND for the free tier's small limits: it runs `claude -p`
-                       (Claude Code headless, on the Pro plan)
+  - GroqProvider            the "real" production path (openai/gpt-oss-120b over Groq's
+                            OpenAI-compatible API, free tier)
+  - ClaudeCLIProvider       a WORKAROUND for the free tier's small limits: it runs `claude -p`
+                            (Claude Code headless, on the Pro plan)
+  - AntigravityCLIProvider  a second WORKAROUND with its own separate quota: it runs `agy`
+                            (Google Antigravity headless) with a Gemini model
 Which backend is used is set by the LLM_BACKEND environment variable (see `get_llm()`).
 
 Why it is needed: the rest of the project only talks to `LLMProvider`, so it does not depend
@@ -34,6 +36,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 
 from sec10k.config import STATE_DIR  # also loads .env
 
@@ -346,10 +349,92 @@ class ClaudeCLIProvider(LLMProvider):
 
 
 # --------------------------------------------------------------------------------------
+# Backend C: Google Antigravity via `agy`  --  also a WORKAROUND, not a production integration.
+# Its 5-hour and weekly quotas are separate from Claude's, so it adds capacity on top of
+# Groq and Claude. A real deployment would call the Gemini API with an API key instead.
+# --------------------------------------------------------------------------------------
+# A custom `agy` agent with no tools and none of the default components. Without it every call
+# carries about 11K tokens of Antigravity's own agent prompt and tool definitions. The system
+# prompt of each call is appended below the front matter.
+_AGY_AGENT_NAME = "plain"
+_AGY_AGENT_FILE = """---
+name: {name}
+description: Plain text-in, text-out assistant with no tools
+mainAgent: true
+tools: []
+excludeDefaultComponents: true
+---
+{system}
+"""
+
+
+class AntigravityCLIProvider(LLMProvider):
+    """WORKAROUND backend: runs Google Antigravity in headless mode (`agy`) with a Gemini model.
+
+    It starts an `agy` process for each call and reads the answer and token usage from its JSON
+    output. Each call runs in an empty temporary folder that holds a minimal agent definition
+    (no tools, no default prompt), so a call costs a few hundred tokens instead of ~11K. The
+    prompt is sent on stdin, which has no practical size limit.
+    """
+
+    backend = "antigravity_cli"
+
+    def __init__(self):
+        """Read the settings from the environment (model, daily cap, requests per minute)."""
+        super().__init__(
+            model=os.getenv("AGY_MODEL", "gemini-4-hydrogen-medium"),
+            # The 5-hour and weekly quotas are not published as token numbers, so this daily
+            # cap is our own choice, to be tuned from real usage (`agy -p /usage` shows the meters).
+            daily_token_limit=int(os.getenv("AGY_DAILY_TOKENS", "2000000")),
+            requests_per_minute=int(os.getenv("AGY_RPM", "10")),
+        )
+
+    def _complete(self, prompt, system, max_tokens):
+        """Run `agy` with the prompt and wrap the answer and token counts in an `LLMResponse`.
+
+        `agy` has no output-length option, so `max_tokens` only affects the budget check.
+        """
+        cmd = [
+            "agy",
+            "--agent", _AGY_AGENT_NAME,
+            "--model", self.model,
+            "--output-format", "json",  # includes the token usage
+        ]
+        # The agent file lives in the temporary folder, which is also the working folder, so no
+        # global Antigravity setup is needed and no project files are picked up.
+        with tempfile.TemporaryDirectory() as cwd:
+            agents_dir = Path(cwd) / ".agents" / "agents"
+            agents_dir.mkdir(parents=True)
+            (agents_dir / f"{_AGY_AGENT_NAME}.md").write_text(
+                _AGY_AGENT_FILE.format(name=_AGY_AGENT_NAME, system=system or "You are a helpful assistant.")
+            )
+            proc = subprocess.run(
+                cmd, input=prompt, capture_output=True, text=True, cwd=cwd, timeout=300
+            )
+        if proc.returncode != 0:
+            raise RuntimeError(f"agy failed ({proc.returncode}): {(proc.stderr or proc.stdout)[-500:]}")
+        out = json.loads(proc.stdout.strip().splitlines()[0])
+        if out.get("status") != "SUCCESS":
+            raise RuntimeError(f"agy returned status {out.get('status')!r}: {str(out)[:500]}")
+        u = out.get("usage", {})
+        return LLMResponse(
+            text=out.get("response", ""),
+            input_tokens=u.get("input_tokens", 0) + u.get("cache_read_tokens", 0),
+            output_tokens=u.get("output_tokens", 0),  # already includes the thinking tokens
+            model=self.model,
+            backend=self.backend,
+        )
+
+
+# --------------------------------------------------------------------------------------
 # Factory: picks the backend
 # --------------------------------------------------------------------------------------
 # The available backends by name, for `get_llm()` and the smoke test.
-_BACKENDS = {"groq": GroqProvider, "claude_cli": ClaudeCLIProvider}
+_BACKENDS = {
+    "groq": GroqProvider,
+    "claude_cli": ClaudeCLIProvider,
+    "antigravity_cli": AntigravityCLIProvider,
+}
 
 
 def get_llm(backend: str | None = None) -> LLMProvider:

@@ -49,6 +49,10 @@ than speed.
 | LLM access | **Swappable LLM backend** behind one interface | Production code shouldn't depend on one vendor |
 | ↳ backend A | `openai/gpt-oss-120b` on **Groq** (free tier, OpenAI-compatible API) | The "real" production path |
 | ↳ backend B | Claude **Sonnet** via `claude -p` (Claude Code headless, $20 Pro plan) | **Workaround** for free-API limits. Keep it clearly labeled as a workaround in code. Sonnet, not Haiku: extraction quality should be close to gpt-oss-120b |
+| ↳ backend C | Gemini (`gemini-4-hydrogen-medium`) via Google Antigravity `agy` (headless) | Second **workaround** with its own 5-hour + weekly quota, separate from Claude's. Labeled as a workaround in code |
+| Backend order | Extraction uses **Groq first, then Antigravity, Sonnet last** | Groq is the production path; Sonnet shares the Pro plan the user needs for Claude Code |
+| Sonnet schedule | **Night (23:00–07:00 IST) and weekly Claude usage < 75%:** may use the full 5-hour window, weekly usage re-checked between batches (stop at 75%). **Daytime:** ask the user for an allowance first; Groq + Antigravity keep running meanwhile | Keeps the Pro plan usable for the user's own work |
+| Starting runs | **Never start an extraction run on your own**, on any backend, at any time (night included). Ask; start only when the user says so, through the user-invoked run skills | Runs spend shared quotas and heat the laptop |
 | Scope | Pipeline built for the **full corpus**, run in waves until everything is done | Shows how production ingestion works: resumable, budgeted, idempotent |
 | Interface | **FastAPI** service | How it would be deployed |
 | Version control | **git**, one commit per completed step (only when the user says to commit) | So each step can be reviewed later |
@@ -58,6 +62,9 @@ than speed.
   **200K tokens/day**. Any code that calls it must have rate limiting, retries and a daily token
   budget.
 - **Claude Pro limits:** usage resets every 5 hours and is not unlimited. Treat it as a budget too.
+  Meters: `claude -p /usage` (5-hour session and weekly %).
+- **Antigravity limits:** separate 5-hour and weekly quotas (roughly 0.6M filing-text tokens/week,
+  measured coarsely). Meters: `agy -p /usage`.
 - **Machine:** Apple M3, 16 GB RAM. Watch memory use (Neo4j + embedding model + Python together).
 - **Never re-pay for work already done:** LLM calls must be cached and the pipeline must be
   resumable. Losing a day's quota to a crash is a bug.

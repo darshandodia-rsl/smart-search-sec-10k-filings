@@ -29,6 +29,8 @@ PROFILE_DIR = DATA / "profile"                       # output of the corpus prof
 HEADINGS_DIR = DATA / "headings"                     # cached bold/italic blocks per filing
 ENTITIES_DIR = DATA / "entities"                     # raw GLiNER entities per filing (tier 3, never edited)
 ENTITIES_CLEAN_DIR = DATA / "entities_clean"         # cleaned entities per filing, rebuilt from raw
+LLM_CACHE_DIR = DATA / "llm_cache"                   # every LLM answer, keyed by prompt + model (never pay twice)
+EXTRACT_PROTO_DIR = DATA / "extract_proto"           # LLM extraction prototype results (Phase 3)
 # Hand-checked names each corpus company goes by (in git, next to the code that uses it).
 COMPANY_ALIASES = ROOT / "src" / "sec10k" / "extract" / "company_aliases.csv"
 
