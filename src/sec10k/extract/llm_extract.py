@@ -301,19 +301,28 @@ def _squash(text: str) -> str:
 _SUFFIX = re.compile(r",?\s+(inc|corp|corporation|co|ltd|limited|llc|plc|n\.?v|s\.?a|ag|se)\.?$")
 
 
-def _name_in(name: str, passage: str) -> bool:
-    """True if an entity name occurs in the (squashed) passage.
+def _name_in(name: str, passage: str, raw: str) -> bool:
+    """True if an entity name occurs in the passage.
 
-    Also accepts the name without a company suffix ("STMicroelectronics N.V." ->
-    "STMicroelectronics") and its initials as a word ("Amazon Web Services" -> "AWS"), since
-    the prompt asks for the fullest name, which may be spelled out elsewhere in the filing.
+    `passage` is the squashed passage (see `_squash`), `raw` the same text as written. The
+    name counts as present when, without a company suffix ("STMicroelectronics N.V." ->
+    "STMicroelectronics"), it occurs in `passage`; plain text matching, so "Israel" is found
+    in "Israeli". A name of several words also counts when its initials appear in capitals
+    in `raw`, with or without dots ("Amazon Web Services" -> "AWS", "United States" ->
+    "U.S."), since the prompt asks for the fullest name, which may be spelled out elsewhere
+    in the filing. Capitals only, so the pronoun "us" never stands for "United States". An
+    empty name is never present.
     """
     n = _SUFFIX.sub("", _squash(name))
+    if not n:
+        return False
     if n in passage:
         return True
     words = re.findall(r"[a-z0-9]+", n)
-    initials = "".join(w[0] for w in words)
-    return len(words) > 1 and re.search(rf"\b{initials}\b", passage) is not None
+    if len(words) < 2:
+        return False
+    initials = r"\.?".join(re.escape(w[0].upper()) for w in words)
+    return re.search(rf"(?<![A-Za-z0-9]){initials}\.?(?![A-Za-z0-9])", raw) is not None
 
 
 def _evidence_match(evidence: str, passage: str) -> str | None:
@@ -385,7 +394,7 @@ def validate_b(facts: list, chunk_text: str, filer: str, stats: dict) -> list[di
             continue
         match = _evidence_match(evidence, passage)
         # Every named entity other than the filer must be named in the passage itself.
-        names_found = all(_name_in(n[1], passage) for n, tok in ((src, s), (dst, o))
+        names_found = all(_name_in(n[1], passage, chunk_text) for n, tok in ((src, s), (dst, o))
                           if tok != "SELF" and n[0] in _NAMED_TYPES)
         key = (src[0], src[1].lower(), rel, dst[0], dst[1].lower())
         if key in out:
@@ -410,7 +419,8 @@ def answers_a(data: dict | None, titles: list[str], stats: dict) -> list[dict | 
     """Turn a route-A answer into one entry per title, in the same order as `titles`.
 
     An entry is the title's classification ({title, risk, category, places}), or None when the
-    answer has no usable item for it (missing, or a category outside the schema); those are
+    answer has no usable item for it (missing, a category outside the schema, or a `risk` /
+    `places` of the wrong type, which would otherwise corrupt the graph writer); those are
     counted in `stats`. Shared by the prototype and the pipeline worker.
     """
     got = {}
@@ -429,9 +439,13 @@ def answers_a(data: dict | None, titles: list[str], stats: dict) -> list[dict | 
         elif it.get("category") not in RISK_CATEGORIES:
             stats["bad_category"] += 1
             out.append(None)
+        elif not (it.get("risk") is None or isinstance(it["risk"], str)) \
+                or not (it.get("places") is None or isinstance(it["places"], list)):
+            stats["bad_type"] += 1               # e.g. "places": "China" or a non-text "risk"
+            out.append(None)
         else:
             out.append({"title": title, "risk": it.get("risk"), "category": it["category"],
-                        "places": it.get("places", [])})
+                        "places": it.get("places") or []})
     return out
 
 

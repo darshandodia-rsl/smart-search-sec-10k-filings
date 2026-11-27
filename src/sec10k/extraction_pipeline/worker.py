@@ -111,6 +111,8 @@ def process_batch(store: JobStore, router: Router, llm: LLMProvider, batch: Batc
         payloads = [None if f is None else {"facts": f} for f in facts]
     done = {it["item_id"]: p for it, p in zip(batch.items, payloads) if p is not None}
     failed = {it["item_id"]: "missing or invalid in the answer" for it, p in zip(batch.items, payloads) if p is None}
+    if not done:
+        drop_cached(llm, batch.system, batch.prompt)   # nothing usable: a retry must ask the LLM again
     store.finish(done, failed, llm.backend, r.model, PROMPT_VERSION)
     store.log_call(llm.backend, batch.route, batch.ticker, len(ids), len(done), r.input_tokens, r.output_tokens,
                    res.seconds, res.cached)

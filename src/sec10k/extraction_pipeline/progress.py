@@ -76,13 +76,17 @@ def status_report(store: JobStore, events_path: Path | None = None) -> str:
     done = st.get("done", 0)
     stuck = q("SELECT COUNT(*) FROM items WHERE status = 'failed' AND attempts >= ?", MAX_ATTEMPTS)[0][0]
     left = total - done - stuck
+    # Reuse items copy their source's facts, so a source that failed for good leaves them with nothing.
+    orphaned = q("SELECT COUNT(*) FROM items r JOIN items s ON s.item_id = r.source"
+                 " WHERE r.kind = 'reuse' AND s.status = 'failed' AND s.attempts >= ?", MAX_ATTEMPTS)[0][0]
     recent = q("SELECT COUNT(*) FROM results WHERE created_at >= ?", _since(RATE_WINDOW_HOURS))[0][0]
     rate = recent / RATE_WINDOW_HOURS
     eta = f"~{left / rate:.0f} h at the last {RATE_WINDOW_HOURS} h's pace" if rate and left else "n/a"
     companies = q("SELECT COUNT(*), SUM(backend IS NOT NULL) FROM companies")[0]
     lines = [f"Extraction: {done:,} / {total:,} items done ({done / total:.0%})" if total else "Extraction: no items",
              f"  left {left:,} (pending {st.get('pending', 0):,}, running {st.get('running', 0):,}, "
-             f"retrying {st.get('failed', 0) - stuck:,}), failed for good {stuck:,}",
+             f"retrying {st.get('failed', 0) - stuck:,}), failed for good {stuck:,}"
+             + (f" (+{orphaned:,} reuse items without facts because their source failed)" if orphaned else ""),
              f"  pace {rate:.0f} items/h, ETA {eta}; companies claimed {companies[1] or 0} / {companies[0]}"]
     gates = {}
     for e in last_events(events_path):
