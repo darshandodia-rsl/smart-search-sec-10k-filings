@@ -128,15 +128,23 @@ type LastRun = {
   lines: string[]
 }
 
-// Pid files of the two runners (written by the run skills); each holds a caffeinate PID that
-// lives exactly as long as its runner.
-const RUNNER_PIDS = ['data/state/extraction_runner_main.pid', 'data/state/extraction_runner_sonnet.pid']
+// Pid files of the extraction runners, one per backend (written by /extract-run); each holds a
+// caffeinate PID that lives exactly as long as its runner. The `main` and `sonnet` files belong
+// to runners started with several backends in one process, and are still checked so such a
+// runner counts as alive.
+const RUNNER_PIDS = [
+  'data/state/extraction_runner_groq.pid',
+  'data/state/extraction_runner_antigravity_cli.pid',
+  'data/state/extraction_runner_claude_cli.pid',
+  'data/state/extraction_runner_main.pid',
+  'data/state/extraction_runner_sonnet.pid',
+]
 
 /**
- * Tells whether any extraction runner (main or Sonnet) is alive right now.
+ * Tells whether any extraction runner is alive right now.
  *
  * The "Last run" card only makes sense between runs, so the pane hides it while this is
- * true. The two runners start and stop independently, so event order alone cannot say
+ * true. The runners start and stop independently, so event order alone cannot say
  * whether one is still going; the pid files can.
  */
 async function runnerActive($: any): Promise<boolean> {

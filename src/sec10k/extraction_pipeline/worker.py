@@ -52,6 +52,10 @@ from sec10k.llm.providers import BudgetExceeded, LLMProvider, get_llm
 
 log = logging.getLogger("sec10k.extraction")
 
+# The short name the user types for each backend in `/extract-run <name>`; used in push
+# messages so they say exactly which command restarts a stopped backend.
+RUN_NAMES = {"groq": "groq", "antigravity_cli": "agy", "claude_cli": "sonnet"}
+
 BACKOFF_START = 30     # seconds to wait after the first failed call in a row
 BACKOFF_MAX = 900      # the wait doubles with each failed call in a row, up to this
 
@@ -151,10 +155,16 @@ def run_backend(backend: str, stop: threading.Event, meters: MeterReader, db_pat
         progress.emit("backend_idle", "no work left", push=True, backend=backend)
         log.info("%s: no work left", backend)
 
-    def blocked(reason: str) -> None:
-        """Report that the backend stops because it is blocked (stop-when-blocked mode)."""
-        progress.emit("backend_stopped", f"stopped, blocked: {reason}. Restart with /extract-run once the "
-                      "limit is restored", push=True, backend=backend)
+    def blocked(reason: str, needs_allowance: bool = False) -> None:
+        """Report that the backend stops because it is blocked (stop-when-blocked mode).
+
+        The message names the command that restarts this backend, so the phone push says
+        exactly what to type.
+        """
+        name = RUN_NAMES.get(backend, backend)
+        hint = (f"Restart with /extract-run {name} <5-hour %> to grant an allowance" if needs_allowance
+                else f"Restart with /extract-run {name} once the limit is restored")
+        progress.emit("backend_stopped", f"stopped, blocked: {reason}. {hint}", push=True, backend=backend)
         log.info("%s: stopped, blocked (%s)", backend, reason)
 
     while not stop.is_set():
@@ -168,7 +178,7 @@ def run_backend(backend: str, stop: threading.Event, meters: MeterReader, db_pat
             break
         gate = router.gate(llm)
         if not gate.allowed and stop_when_blocked:
-            blocked(gate.reason)
+            blocked(gate.reason, gate.needs_allowance)
             break
         if gate.allowed != gate_was_open:
             kind = "gate_opened" if gate.allowed else "gate_closed"
@@ -177,7 +187,7 @@ def run_backend(backend: str, stop: threading.Event, meters: MeterReader, db_pat
             gate_was_open = gate.allowed
         if not gate.allowed:
             if gate.needs_allowance and time.monotonic() - last_allowance_ask > progress.ALLOWANCE_REMINDER_MIN * 60:
-                progress.emit("needs_allowance", f"Sonnet waiting: {gate.reason}. Reply with /extract-sonnet <5-hour %>",
+                progress.emit("needs_allowance", f"Sonnet waiting: {gate.reason}. Reply with /extract-run sonnet <5-hour %>",
                               push=True, backend=backend)
                 last_allowance_ask = time.monotonic()
             log.info("%s: waiting %d min (%s)", backend, gate.wait_seconds // 60, gate.reason)

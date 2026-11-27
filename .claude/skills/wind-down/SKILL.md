@@ -2,6 +2,7 @@
 name: wind-down
 description: End the working day on the smart-search-sec-10k-filings project. Gracefully stops any running project jobs (ingestion, embedding, API server), stops every Docker container, and then quits OrbStack itself, so nothing is left running or half-written. Use when the user says "wind down", "end of day", "shut everything down" or "stop all containers".
 disable-model-invocation: true
+argument-hint: "[groq | agy | sonnet]   (a name = stop only that extraction backend's runner)"
 ---
 
 # Wind down
@@ -9,6 +10,16 @@ disable-model-invocation: true
 Stop everything the project started, in an order that avoids corrupting data. Run commands from the
 project root. Say in one line what you are about to stop before stopping it. Never use `kill -9`,
 `docker kill`, `docker compose down -v`, or `docker system prune`: they can lose data or work.
+
+## 0. Only one backend (when a name was given)
+
+With `groq`, `agy` or `sonnet` (backends `groq`, `antigravity_cli`, `claude_cli`): stop **only** that
+extraction backend's runner and nothing else (no other runners, no Docker, no OrbStack).
+Find it with `pgrep -fl "extraction_pipeline.worker --backends"`: the process whose `--backends` list
+contains that backend (its pid is also in `data/state/extraction_runner_<backend>.pid`). If that
+process also runs other backends (an older runner started with several), say so and ask before
+stopping it, since it would stop those too. Stop it as in step 1.3–1.6 (SIGINT, wait, SIGTERM),
+report, and end here. If no runner for it is alive, say so.
 
 ## 1. Stop project jobs first (they write to Neo4j)
 

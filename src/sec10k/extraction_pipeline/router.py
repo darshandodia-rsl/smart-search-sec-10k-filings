@@ -169,7 +169,7 @@ def grant_sonnet_allowance(max_session_pct: float, over_weekly: bool, meters: Me
     It is valid until the current 5-hour window resets (or 5 hours if the reset time is
     unknown); after that a new allowance is needed. `over_weekly` lets Sonnet run even at
     weekly usage >= SONNET_DAY_WEEK_MAX, which the user must ask for explicitly.
-    Called by the `/extract-sonnet` skill through this module's command line.
+    Called by the `/extract-run sonnet <PCT>` skill through this module's command line.
     """
     expires = meters.session_resets or now + timedelta(hours=5)
     data = {"max_session_pct": max_session_pct, "over_weekly": over_weekly,
