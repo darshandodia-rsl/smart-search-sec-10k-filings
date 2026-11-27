@@ -226,7 +226,7 @@ def names_other_company(entities: list[Entity]) -> bool:
 # --------------------------------------------------------------------------------------
 # Files
 # --------------------------------------------------------------------------------------
-def _clean_path(accession: str):
+def clean_path(accession: str):
     """Where a filing's cleaned entities are stored."""
     return ENTITIES_CLEAN_DIR / f"{accession}.json"
 
@@ -245,8 +245,8 @@ def clean_all(tickers: list[str] | None = None) -> None:
     if tickers:
         manifest = manifest[manifest["ticker"].isin(tickers)]
     todo = [p for p in (ENTITIES_DIR / f"{a}.json" for a in manifest.accession_number) if p.exists()
-            and not (_clean_path(p.stem).exists()
-                     and json.loads(_clean_path(p.stem).read_text()).get("source_key") == key)]
+            and not (clean_path(p.stem).exists()
+                     and json.loads(clean_path(p.stem).read_text()).get("source_key") == key)]
     if not todo:
         print(f"All cleaned files up to date (clean_version {CLEAN_VERSION})")
         return
@@ -266,7 +266,7 @@ def clean_all(tickers: list[str] | None = None) -> None:
         clean = {"accession": data["accession"], "ticker": ticker,
                  "fiscal_year": data["fiscal_year"], "clean_version": CLEAN_VERSION,
                  "source_key": key, "raw_settings": data["settings"], "chunks": chunks}
-        out = _clean_path(p.stem)
+        out = clean_path(p.stem)
         tmp = out.with_suffix(".tmp")
         tmp.write_text(json.dumps(clean))
         tmp.replace(out)  # atomic: the file is either complete or absent
@@ -276,7 +276,7 @@ def clean_all(tickers: list[str] | None = None) -> None:
 
 def load_entities(accession: str) -> dict[str, list[Entity]]:
     """Return the cleaned entities of one filing, keyed by chunk_id."""
-    p = _clean_path(accession)
+    p = clean_path(accession)
     if not p.exists():
         raise FileNotFoundError(f"{p} missing: run `python -m sec10k.extract.entity_cleaning clean`")
     data = json.loads(p.read_text())
@@ -291,7 +291,7 @@ def report(tickers: list[str] | None = None) -> None:
     n_files = n_chunks = n_flag = n_relabeled = 0
     by_label, top = Counter(), {lab: Counter() for lab in LABELS}
     for accession in manifest.accession_number:
-        p = _clean_path(accession)
+        p = clean_path(accession)
         if not p.exists():
             continue
         n_files += 1

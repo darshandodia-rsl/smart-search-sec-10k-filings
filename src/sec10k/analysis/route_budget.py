@@ -26,7 +26,7 @@ from collections import Counter
 
 from sec10k.analysis.profile_corpus import ENC, content_per_day
 from sec10k.extract.companies import CompanyMatcher
-from sec10k.extract.entity_cleaning import _clean_path
+from sec10k.extract.entity_cleaning import clean_path
 from sec10k.extract.patterns import find_cues
 from sec10k.ingest.chunker import iter_chunks
 
@@ -45,7 +45,7 @@ def main() -> None:
         if c.accession != current:
             current = c.accession
             flag3 = {x["chunk_id"]: x["names_other_company"]
-                     for x in json.loads(_clean_path(c.accession).read_text())["chunks"]}
+                     for x in json.loads(clean_path(c.accession).read_text())["chunks"]}
         t = len(ENC.encode(c.text))
         tok["all"] += t
         n["all"] += 1

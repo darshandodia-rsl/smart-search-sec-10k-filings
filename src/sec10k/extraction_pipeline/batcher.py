@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sec10k.extract.llm_extract import (BATCH_BY_BACKEND, BATCH_DEFAULT, SYSTEM_A, SYSTEM_B,
-                                        _filer_name, prompt_a, prompt_b)
+                                        filer_name, prompt_a, prompt_b)
 from sec10k.extraction_pipeline.jobs import JobStore
 from sec10k.ingest.chunker import Chunk, iter_chunks
 
@@ -79,7 +79,7 @@ class Batcher:
         if ticker is None:
             return None
         size = self.titles_per_call if route == "A" else self.chunks_per_call
-        name = _filer_name(ticker)
+        name = filer_name(ticker)
         # Load the chunk texts before claiming, so a failure here leaves no item stuck "running".
         by_id = self._company_chunks(ticker) if route == "B" else {}
         items = self.store.claim(route, ticker, size, self.backend)

@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from sec10k.config import EXTRACTION_LOG, JOBS_DB
-from sec10k.extract.llm_extract import (PROMPT_VERSION, _filer_name, answers_a, answers_b, call_cached,
+from sec10k.extract.llm_extract import (PROMPT_VERSION, filer_name, answers_a, answers_b, call_cached,
                                         drop_cached)
 from sec10k.extraction_pipeline import progress
 from sec10k.extraction_pipeline.batcher import Batch, Batcher
@@ -107,7 +107,7 @@ def process_batch(store: JobStore, router: Router, llm: LLMProvider, batch: Batc
     if batch.route == "A":
         payloads = answers_a(res.data, [it["title"] for it in batch.items], stats)
     else:
-        facts = answers_b(res.data, batch.chunks, _filer_name(batch.ticker), stats)
+        facts = answers_b(res.data, batch.chunks, filer_name(batch.ticker), stats)
         payloads = [None if f is None else {"facts": f} for f in facts]
     done = {it["item_id"]: p for it, p in zip(batch.items, payloads) if p is not None}
     failed = {it["item_id"]: "missing or invalid in the answer" for it, p in zip(batch.items, payloads) if p is None}

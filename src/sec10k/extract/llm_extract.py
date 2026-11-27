@@ -1,4 +1,4 @@
-"""Tier 4 extraction: schema-guided LLM extraction for routes A and B (Phase 3 prototype).
+"""Tier 4 extraction: schema-guided LLM extraction for routes A and B (prompts, validation, cache).
 
 What it does:
   - Route A: sends a filing's distinct Item 1A risk titles to the LLM, 50 per call (25 on Groq), and gets
@@ -17,14 +17,16 @@ What it does:
     so re-running never pays for the same call twice.
   - Writes results to `data/extract_proto/{accession}_{A|B}.json`.
 
-Why it is needed: this is the step that turns text into graph facts. The prototype checks
-the prompts on a few filings by hand and measures real tokens per call, before the
-production pipeline (Phase 4) runs it on the whole corpus.
+Why it is needed: this is the step that turns text into graph facts. The production
+pipeline (`extraction_pipeline/`) imports its prompts, validation and cache from here, and
+running this module on a few filings checks the prompts by hand and measures real tokens per call.
 
 The prompts are built from the schema, so changing the schema changes the prompts. Raise
 PROMPT_VERSION whenever a prompt changes; cached answers of older versions are then ignored.
+Also add the new version to `SCHEMA_VERSION_BY_PROMPT` in `graph/schema.py`; without that entry
+the graph writer (`graph/facts.py`) stops with an error on the first result of the new version.
 
-Run: .venv/bin/python -m sec10k.extract.llm_extract TICKER FISCAL_YEAR [--backend claude_cli]
+Run: .venv/bin/python -m sec10k.extract.llm_extract TICKER FISCAL_YEAR --backend groq|antigravity_cli|claude_cli
        [--max-a-calls N] [--max-b-calls N]
 """
 
@@ -36,6 +38,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from functools import cache
 
 from sec10k.config import EXTRACT_PROTO_DIR, LLM_CACHE_DIR, load_manifest
 from sec10k.extract.companies import CompanyMatcher, load_aliases
@@ -44,6 +47,7 @@ from sec10k.extract.patterns import find_cues
 from sec10k.graph.schema import (ENTITY_TYPES, RELATION_TYPES, RISK_CATEGORIES, SCHEMA_VERSION,
                                  VALIDATION_SCHEMA)
 from sec10k.ingest.chunker import Chunk, iter_chunks
+from sec10k.ingest.loader import SECTION_TITLES
 from sec10k.llm.providers import LLMProvider, LLMResponse, get_llm
 
 PROMPT_VERSION = 6
@@ -52,8 +56,6 @@ PROMPT_VERSION = 6
 # reasoning), so one Groq call must stay well under 8K; the other backends take larger batches.
 BATCH_DEFAULT = (50, 8, 8000)
 BATCH_BY_BACKEND = {"groq": (25, 4, 4000)}
-SECTION_NAMES = {"item_1": "Item 1 Business", "item_1A": "Item 1A Risk Factors",
-                 "item_7": "Item 7 MD&A", "item_7A": "Item 7A Market Risk"}
 
 # --------------------------------------------------------------------------------------
 # Prompts (built from the schema)
@@ -121,9 +123,15 @@ Answer with compact JSON only, no other text: an object mapping each passage num
  "2": []}}"""
 
 
-def _filer_name(ticker: str) -> str:
+@cache
+def _first_aliases() -> dict[str, str]:
+    """Map each ticker to its first alias; the alias CSV is read once per process."""
+    return load_aliases().drop_duplicates("ticker").set_index("ticker").alias.to_dict()
+
+
+def filer_name(ticker: str) -> str:
     """The company's common name (first alias in the alias table), e.g. "Microsoft"."""
-    return load_aliases().query("ticker == @ticker").alias.iloc[0]
+    return _first_aliases()[ticker]
 
 
 def prompt_a(name: str, ticker: str, titles: list[str]) -> str:
@@ -147,7 +155,7 @@ def prompt_b(name: str, ticker: str, chunks: list[Chunk]) -> str:
     parts = [f"Filing company: {name} ({ticker}), 10-K annual reports.\n"]
     for i, c in enumerate(chunks, 1):
         head = f" | heading: {c.heading}" if c.heading else ""
-        parts.append(f"--- Passage {i} (FY{c.fiscal_year}, {SECTION_NAMES[c.section]}{head})\n{c.text}\n")
+        parts.append(f"--- Passage {i} (FY{c.fiscal_year}, {SECTION_TITLES[c.section]}{head})\n{c.text}\n")
     return "\n".join(parts)
 
 
@@ -449,14 +457,19 @@ def answers_b(data: dict | None, chunks: list[Chunk], filer: str, stats: dict) -
 # --------------------------------------------------------------------------------------
 # Running the prototype on one filing
 # --------------------------------------------------------------------------------------
-def run(ticker: str, fy: int, backend: str = "claude_cli",
+def run(ticker: str, fy: int, backend: str,
         max_a_calls: int | None = None, max_b_calls: int | None = None) -> None:
-    """Extract routes A and B for one filing, validate, save and print a summary."""
+    """Extract routes A and B for one filing, validate, save and print a summary.
+
+    Spends quota on `backend` directly, without the pipeline's router (no Sonnet schedule, no
+    usage meters; only the backend's daily token cap applies). So the backend has no default:
+    the caller always names the one whose quota is spent.
+    """
     from collections import Counter
 
     llm = get_llm(backend)
     titles_per_call, chunks_per_call, max_out = BATCH_BY_BACKEND.get(backend, BATCH_DEFAULT)
-    name = _filer_name(ticker)
+    name = filer_name(ticker)
     row, titles, chunks = filing_inputs(ticker, fy)
     print(f"{ticker} FY{fy} ({row.accession_number}) via {backend}/{llm.model}: "
           f"{len(titles)} new risk titles, {len(chunks)} route-B chunks")
@@ -510,7 +523,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("ticker")
     ap.add_argument("fiscal_year", type=int)
-    ap.add_argument("--backend", default="claude_cli", help="groq, antigravity_cli or claude_cli")
+    ap.add_argument("--backend", required=True, choices=["groq", "antigravity_cli", "claude_cli"],
+                    help="backend whose quota is spent (required: this bypasses the pipeline's gates)")
     ap.add_argument("--max-a-calls", type=int, help="stop route A after this many calls")
     ap.add_argument("--max-b-calls", type=int, help="stop route B after this many calls")
     a = ap.parse_args()

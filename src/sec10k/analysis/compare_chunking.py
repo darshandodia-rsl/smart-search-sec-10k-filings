@@ -26,20 +26,20 @@ from llama_index.core.node_parser import SemanticSplitterNodeParser, SentenceSpl
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from transformers import AutoTokenizer
 
+from sec10k.config import BGE_MAX_TOKENS, EMBED_MODEL
 from sec10k.ingest.loader import iter_clean_sections
 
-MODEL = "BAAI/bge-base-en-v1.5"    # the embedding model; its tokenizer measures chunk sizes
 # The sample filings to chunk: Microsoft FY2022 and FY2023, Salesforce FY2023.
 FILINGS = {("MSFT", 2022), ("MSFT", 2023), ("CRM", 2023)}
 CHUNK_TOKENS = 400    # target chunk size in tokens
-BGE_LIMIT = 512      # the embedding model's input limit; text past it is cut off
 
-tok = AutoTokenizer.from_pretrained(MODEL)
+# The project's embedding model (from config.py); its tokenizer measures chunk sizes.
+tok = AutoTokenizer.from_pretrained(EMBED_MODEL)
 # Counts the embedding-model tokens in a text.
 n_tokens = lambda s: len(tok.encode(s, add_special_tokens=False))  # noqa: E731
 
 # The embedding model the semantic splitter uses to compare neighbouring sentences.
-embed = HuggingFaceEmbedding(model_name=MODEL, device="mps")
+embed = HuggingFaceEmbedding(model_name=EMBED_MODEL, device="mps")
 # The two chunking methods under comparison.
 splitters = {
     "paragraph": SentenceSplitter(chunk_size=CHUNK_TOKENS, chunk_overlap=0, paragraph_separator="\n",
@@ -73,8 +73,8 @@ for name, splitter in splitters.items():
     results[name] = chunks
     print(f"== {name}: {n} chunks in {secs:.1f}s")
     print(f"   tokens  p5={sizes[n // 20]}  median={sizes[n // 2]}  p95={sizes[n * 19 // 20]}  max={sizes[-1]}")
-    print(f"   > {BGE_LIMIT} tokens (truncated): {sum(x > BGE_LIMIT for x in sizes)} "
-          f"({sum(max(0, x - BGE_LIMIT) for x in sizes):,} tokens lost)")
+    print(f"   > {BGE_MAX_TOKENS} tokens (truncated): {sum(x > BGE_MAX_TOKENS for x in sizes)} "
+          f"({sum(max(0, x - BGE_MAX_TOKENS) for x in sizes):,} tokens lost)")
     print(f"   < 50 tokens (tiny): {sum(x < 50 for x in sizes)}")
     print(f"   MSFT FY2023 chunks identical to a FY2022 chunk: {same}/{total} ({same / total:.0%})\n")
 

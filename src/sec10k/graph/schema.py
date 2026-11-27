@@ -139,6 +139,12 @@ MENTIONS_RELATION = "MENTIONS"
 # and re-extracted selectively instead of re-running the whole corpus.
 SCHEMA_VERSION = 3
 
+# The schema version each extraction prompt version was written for. The graph writer uses it
+# to stamp every fact with the schema it was extracted under (from the prompt version stored
+# with the result), not the schema that is current when the graph is written. Add an entry
+# whenever PROMPT_VERSION is raised.
+SCHEMA_VERSION_BY_PROMPT: dict[int, int] = {5: 2, 6: 3}
+
 
 def check_schema() -> None:
     """Check that the schema is consistent; raise `ValueError` on the first problem.

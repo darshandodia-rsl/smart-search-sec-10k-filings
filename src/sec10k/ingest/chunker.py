@@ -37,12 +37,11 @@ import pandas as pd
 from llama_index.core.node_parser import SentenceSplitter
 from transformers import AutoTokenizer
 
-from sec10k.config import EMBED_MODEL, load_manifest
+from sec10k.config import BGE_MAX_TOKENS, EMBED_MODEL, load_manifest
 from sec10k.ingest.headings import load_headings, lookup
 from sec10k.ingest.loader import SECTION_TITLES, Section, iter_clean_sections
 
 MAX_TOKENS = 400          # most tokens of text per chunk; the header adds ~20-60 more, staying under 512
-BGE_LIMIT = 512           # the embedding model's input limit
 MAX_HEADING_WORDS = 30    # headings longer than this are cut short when put in the header
 
 _tok = AutoTokenizer.from_pretrained(EMBED_MODEL)
@@ -208,8 +207,8 @@ def report(chunks: list[Chunk]) -> None:
           f"{df['n_tokens'].sum() / 1e6:.2f}M text tokens")
     print(f"text tokens: p5={q[0.05]} p25={q[0.25]} median={q[0.5]} p75={q[0.75]} "
           f"p95={q[0.95]} max={df['n_tokens'].max()}")
-    print(f"embed text (with header) max={df['embed_tokens'].max()}, over {BGE_LIMIT}: "
-          f"{(df['embed_tokens'] > BGE_LIMIT).sum()}")
+    print(f"embed text (with header) max={df['embed_tokens'].max()}, over {BGE_MAX_TOKENS}: "
+          f"{(df['embed_tokens'] > BGE_MAX_TOKENS).sum()}")
     print(f"tiny (< 50 tokens): {(df['n_tokens'] < 50).sum()} "
           f"({(df['n_tokens'] < 50).mean():.1%})   with a heading: {df['heading'].notna().mean():.1%}\n")
     print("Per section:")

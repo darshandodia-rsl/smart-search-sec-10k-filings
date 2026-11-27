@@ -1,6 +1,11 @@
 # Direct dependencies of the GraphRAG code (src/), pinned to tested versions.
 # Install: .venv/bin/pip install -r requirements.txt   (Python 3.12)
-# The edgar-crawler's own deps live in data/edgar-software-corpus/edgar-crawler/ (installed unpinned).
+# The edgar-crawler's deps (needed only to rebuild the corpus) are pinned in corpus/requirements.txt.
+
+# Used directly by src/: pandas in config.py (manifest/companies CSVs), lxml in ingest/headings.py
+# (same pins as corpus/requirements.txt so the two files agree)
+pandas==3.1.1
+lxml==6.1.3
 
 # Framework + local embeddings (pulls in torch, transformers, sentence-transformers)
 llama-index-core==0.14.26

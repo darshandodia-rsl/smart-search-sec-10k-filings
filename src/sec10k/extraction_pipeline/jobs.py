@@ -36,9 +36,12 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from sec10k.config import JOBS_DB
-from sec10k.extraction_pipeline.planner import WorkItem, plan_wave
+
+if TYPE_CHECKING:  # type hints only; the planner pulls in the tokenizer, which is slow to load
+    from sec10k.extraction_pipeline.planner import WorkItem
 
 MAX_ATTEMPTS = 3   # a failed item is retried until it has been tried this many times
 # SQL condition for "ready for an LLM call": pending, or failed with attempts left (takes MAX_ATTEMPTS).
@@ -144,8 +147,13 @@ class JobStore:
         with the current prompt (its old result is replaced when the new one is saved).
         `route` ("A" or "B") limits the requeue to that route, e.g. when only the route-B
         prompt changed; the other route's results are kept.
+        Items that stay in the plan but whose kind, source or title changed are updated to the
+        new plan (an item that switches between extract and reuse drops its old result and
+        starts over). Refuses, before changing anything, if a "reuse" item of another filing
+        (outside `items`) would be left without an extractable source, since its facts would
+        silently vanish from the graph: replan those filings too.
         Refuses while any of those filings has items running, since a runner is working on them.
-        Returns counts of removed, added and requeued items.
+        Returns counts of removed, added, updated and requeued items.
         """
         accessions = sorted({i.accession for i in items})
         marks = ",".join("?" * len(accessions))
@@ -155,9 +163,35 @@ class JobStore:
         planned = {i.item_id for i in items}
         stale = [r[0] for r in self.db.execute(f"SELECT item_id FROM items WHERE accession IN ({marks})", accessions)
                  if r[0] not in planned]
+        # Sources a reuse item outside these filings may point to after the change: planned
+        # extract items, plus extract items of other filings (which stay as they are).
+        keep = {i.item_id for i in items if i.kind == "extract"} | {
+            r[0] for r in self.db.execute(
+                f"SELECT item_id FROM items WHERE kind = 'extract' AND accession NOT IN ({marks})", accessions)}
+        orphans = [r[0] for r in self.db.execute(
+            f"SELECT item_id, source FROM items WHERE kind = 'reuse' AND accession NOT IN ({marks})", accessions)
+            if r[1] not in keep]
+        if orphans:
+            raise RuntimeError(f"{len(orphans)} reuse items of other filings would lose their source "
+                               f"(e.g. {orphans[0]}): replan those filings too")
+        existing = {r["item_id"]: r for r in self.db.execute(
+            f"SELECT item_id, kind, source, title FROM items WHERE accession IN ({marks})", accessions)}
+        changed = [i for i in items if i.item_id in existing
+                   and (existing[i.item_id]["kind"], existing[i.item_id]["source"], existing[i.item_id]["title"])
+                   != (i.kind, i.source, i.title)]
         with self.db:
             self.db.executemany("DELETE FROM results WHERE item_id = ?", [(i,) for i in stale])
             self.db.executemany("DELETE FROM items WHERE item_id = ?", [(i,) for i in stale])
+            for i in changed:
+                if existing[i.item_id]["kind"] != i.kind:   # extract <-> reuse: the old result no longer applies
+                    self.db.execute("DELETE FROM results WHERE item_id = ?", (i.item_id,))
+                    self.db.execute("UPDATE items SET kind = ?, source = ?, title = ?, status = ?, attempts = 0,"
+                                    " last_error = NULL, updated_at = ? WHERE item_id = ?",
+                                    (i.kind, i.source, i.title, "pending" if i.kind == "extract" else "reuse",
+                                     _now(), i.item_id))
+                else:
+                    self.db.execute("UPDATE items SET source = ?, title = ?, updated_at = ? WHERE item_id = ?",
+                                    (i.source, i.title, _now(), i.item_id))
         added = self.add(items)
         requeued = 0
         if requeue:
@@ -166,7 +200,7 @@ class JobStore:
                     "UPDATE items SET status = 'pending', attempts = 0, last_error = NULL, updated_at = ?"
                     f" WHERE accession IN ({marks}) AND kind = 'extract' AND status IN ('done', 'failed')"
                     " AND (? IS NULL OR route = ?)", (_now(), *accessions, route, route)).rowcount
-        return {"removed": len(stale), "added": added, "requeued": requeued}
+        return {"removed": len(stale), "added": added, "updated": len(changed), "requeued": requeued}
 
     def recover(self, backends: list[str]) -> int:
         """Put items of `backends` left "running" by a crash back to "pending". Call when a runner starts.
@@ -324,6 +358,8 @@ if __name__ == "__main__":
     ap.add_argument("--db", type=Path, default=JOBS_DB, help="job store file (default: the real one)")
     a = ap.parse_args()
     js = JobStore(a.db)
+    if a.cmd in ("add", "replan"):
+        from sec10k.extraction_pipeline.planner import plan_wave  # slow import: only these commands need it
     if a.cmd == "add":
         print(f"added {js.add(plan_wave(a.tickers, a.first_years))} new items")
     elif a.cmd == "replan":

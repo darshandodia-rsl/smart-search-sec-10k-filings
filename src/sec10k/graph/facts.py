@@ -38,8 +38,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from sec10k.config import JOBS_DB, load_companies
-from sec10k.extract.llm_extract import _filer_name
-from sec10k.graph.schema import ENTITY_TYPES, MENTIONS_RELATION, RELATION_TYPES, SCHEMA_VERSION
+from sec10k.extract.llm_extract import filer_name
+from sec10k.graph.schema import ENTITY_TYPES, MENTIONS_RELATION, RELATION_TYPES, SCHEMA_VERSION_BY_PROMPT
 from sec10k.graph.store import get_graph_store
 
 _EDGE_TYPES = list(RELATION_TYPES) + [MENTIONS_RELATION]
@@ -73,7 +73,8 @@ class CompanyFacts:
     """The extracted layer of one company, collected in memory before it is written.
 
     `nodes`: entity id -> (label, display name, extra properties).
-    `edges`: (relation, subject id, object id, fiscal year) -> chunk_ids, evidence, verified.
+    `edges`: (relation, subject id, object id, fiscal year) -> chunk_ids, evidence, verified,
+    schema_version (the oldest schema version among the chunks that support the edge).
     `mentions`: (chunk id, entity id) pairs.
     """
 
@@ -83,7 +84,8 @@ class CompanyFacts:
         self.filer_node_id = filer_node_id
         self.filer_name = filer_name.lower()
         self.nodes: dict[str, tuple[str, str, dict]] = {}
-        self.edges: dict[tuple, dict] = defaultdict(lambda: {"chunk_ids": [], "evidence": [], "verified": False})
+        self.edges: dict[tuple, dict] = defaultdict(
+            lambda: {"chunk_ids": [], "evidence": [], "verified": False, "schema_version": None})
         self.mentions: set[tuple[str, str]] = set()
 
     def node(self, label: str, name: str, chunk_id: str, category: str | None = None) -> str:
@@ -96,29 +98,35 @@ class CompanyFacts:
         self.mentions.add((chunk_id, nid))
         return nid
 
-    def edge(self, rel: str, s: str, o: str, fy: int, chunk_id: str, evidence: str, verified: bool) -> None:
-        """Add one chunk's support for a fact; facts repeated across chunks of a year share one edge."""
+    def edge(self, rel: str, s: str, o: str, fy: int, chunk_id: str, evidence: str, verified: bool,
+             sv: int) -> None:
+        """Add one chunk's support for a fact; facts repeated across chunks of a year share one edge.
+
+        `sv` is the schema version the chunk's result was extracted under; if chunks of different
+        versions share an edge, the oldest wins so a selective re-extraction still finds it.
+        """
         e = self.edges[(rel, s, o, fy)]
         if chunk_id not in e["chunk_ids"]:
             e["chunk_ids"].append(chunk_id)
             e["evidence"].append(evidence)
         e["verified"] = e["verified"] or verified
+        e["schema_version"] = sv if e["schema_version"] is None else min(e["schema_version"], sv)
 
-    def add_risk(self, payload: dict, fy: int, chunk_id: str) -> None:
+    def add_risk(self, payload: dict, fy: int, chunk_id: str, sv: int) -> None:
         """Add a route-A result: the filer faces the risk, and the risk concerns the places in its title."""
         risk = self.node("Risk", payload["risk"] or payload["title"], chunk_id, payload["category"])
-        self.edge("FACES_RISK", self.filer_node_id, risk, fy, chunk_id, payload["title"], True)
+        self.edge("FACES_RISK", self.filer_node_id, risk, fy, chunk_id, payload["title"], True, sv)
         for place in payload.get("places") or []:
             if isinstance(place, str) and place.strip():
                 geo = self.node("Geography", place, chunk_id)
-                self.edge("CONCERNS", risk, geo, fy, chunk_id, payload["title"], True)
+                self.edge("CONCERNS", risk, geo, fy, chunk_id, payload["title"], True, sv)
 
-    def add_facts(self, payload: dict, fy: int, chunk_id: str) -> None:
+    def add_facts(self, payload: dict, fy: int, chunk_id: str, sv: int) -> None:
         """Add a route-B result: every validated fact of one chunk."""
         for f in payload["facts"]:
             s = self.node(f["source_type"], f["source"], chunk_id, f.get("category") if f["source_type"] == "Risk" else None)
             o = self.node(f["target_type"], f["target"], chunk_id, f.get("category") if f["target_type"] == "Risk" else None)
-            self.edge(f["relation"], s, o, fy, chunk_id, f["evidence"], bool(f.get("verified")))
+            self.edge(f["relation"], s, o, fy, chunk_id, f["evidence"], bool(f.get("verified")), sv)
 
 
 def collect(db: sqlite3.Connection, ticker: str, filer_node_id: str) -> CompanyFacts:
@@ -127,20 +135,21 @@ def collect(db: sqlite3.Connection, ticker: str, filer_node_id: str) -> CompanyF
     A reuse item whose source is waiting to be extracted again (e.g. after a requeue) is left
     out until the source is done, so an old result never reaches the graph.
     """
-    cf = CompanyFacts(ticker, filer_node_id, _filer_name(ticker))
+    cf = CompanyFacts(ticker, filer_node_id, filer_name(ticker))
     rows = db.execute(
-        "SELECT i.route, i.fiscal_year, i.chunk_id, r.payload FROM items i"
+        "SELECT i.route, i.fiscal_year, i.chunk_id, r.payload, r.prompt_version FROM items i"
         " LEFT JOIN items s ON s.item_id = i.source"
         " JOIN results r ON r.item_id = COALESCE(i.source, i.item_id)"
         " WHERE i.ticker = ? AND ((i.kind = 'extract' AND i.status = 'done')"
         "  OR (i.kind = 'reuse' AND s.status = 'done'))"
         " ORDER BY i.fiscal_year, i.chunk_id", (ticker,))
-    for route, fy, chunk_id, payload in rows:
+    for route, fy, chunk_id, payload, prompt_version in rows:
         p = json.loads(payload)
+        sv = SCHEMA_VERSION_BY_PROMPT[prompt_version]   # unknown prompt version: fail, don't guess
         if route == "A":
-            cf.add_risk(p, fy, chunk_id)
+            cf.add_risk(p, fy, chunk_id, sv)
         else:
-            cf.add_facts(p, fy, chunk_id)
+            cf.add_facts(p, fy, chunk_id, sv)
     return cf
 
 
@@ -177,8 +186,8 @@ def write_company(store, cf: CompanyFacts) -> Counter:
                   MATCH (s:__Node__ {{id: row.s}}) MATCH (o:__Node__ {{id: row.o}})
                   MERGE (s)-[r:{rel} {{fiscal_year: row.fy, ticker: $t}}]->(o)
                   SET r.chunk_ids = row.chunk_ids, r.evidence = row.evidence, r.verified = row.verified,
-                      r.schema_version = $sv
-                  RETURN count(r) AS n""", param_map={"rows": rows, "t": t, "sv": SCHEMA_VERSION})[0]["n"]
+                      r.schema_version = row.schema_version
+                  RETURN count(r) AS n""", param_map={"rows": rows, "t": t})[0]["n"]
         out[rel] += n
         out["edges_missing_node"] += len(rows) - n
     rows = [{"c": c, "e": e} for c, e in cf.mentions]

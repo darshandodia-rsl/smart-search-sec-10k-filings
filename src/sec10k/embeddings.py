@@ -16,10 +16,7 @@ from functools import cache
 
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-from sec10k.config import EMBED_MODEL
-
-# The most tokens bge can read at once. The chunker keeps every chunk below this.
-BGE_MAX_TOKENS = 512
+from sec10k.config import BGE_MAX_TOKENS, EMBED_MODEL
 
 
 @cache

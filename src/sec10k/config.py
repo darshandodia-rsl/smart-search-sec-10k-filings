@@ -43,6 +43,9 @@ COMPANY_ALIASES = ROOT / "src" / "sec10k" / "extract" / "company_aliases.csv"
 # chunk sizes with this model's tokenizer, so chunker and embedder must use the same model.
 EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 EMBED_DIM = 768
+# The most tokens bge can read at once. The chunker keeps every chunk below this, and the
+# embedder truncates anything longer.
+BGE_MAX_TOKENS = 512
 
 # The four 10-K sections we use, in the order they appear in a filing:
 # Business, Risk Factors, MD&A, Market Risk.

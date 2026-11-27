@@ -22,6 +22,12 @@ const extTick = atom({ plugin: 'plan-progress', key: 'extTick' } as const, 0, {
   shape: 'extTick-1',
 })
 const EXT_POLL_MS = 30 * 1000
+// Cards the user closed in the Extraction pane, by key ("caught:<tickers>", "last:<end time>").
+// A key names the card's content, so a card comes back when its content changes (a new run,
+// a different set of caught-up companies) and in every new session.
+const dismissed = atom({ plugin: 'plan-progress', key: 'dismissed' } as const, [] as string[], {
+  shape: 'dismissed-1',
+})
 // The job store the extraction runner writes (relative to the project root).
 const JOBS_DB = 'data/state/extraction_jobs.sqlite'
 // All companies in the corpus (companies.csv); the job store only holds those added so far.
@@ -129,15 +135,11 @@ type LastRun = {
 }
 
 // Pid files of the extraction runners, one per backend (written by /extract-run); each holds a
-// caffeinate PID that lives exactly as long as its runner. The `main` and `sonnet` files belong
-// to runners started with several backends in one process, and are still checked so such a
-// runner counts as alive.
+// caffeinate PID that lives exactly as long as its runner.
 const RUNNER_PIDS = [
   'data/state/extraction_runner_groq.pid',
   'data/state/extraction_runner_antigravity_cli.pid',
   'data/state/extraction_runner_claude_cli.pid',
-  'data/state/extraction_runner_main.pid',
-  'data/state/extraction_runner_sonnet.pid',
 ]
 
 /**
@@ -213,12 +215,7 @@ type CompanyRow = {
   y0: number | null
   y1: number | null
   last: string | null
-  /** Items of this company finished in the last ETA_WINDOW_MIN minutes: its recent pace. */
-  recent: number | null
 }
-
-// The ETA uses the pace of the last this many minutes ("at the current pace").
-const ETA_WINDOW_MIN = 60
 
 /**
  * Reads per-company progress from the extraction job store.
@@ -235,10 +232,7 @@ async function readCompanies($: any): Promise<CompanyRow[] | null> {
       SUM(i.kind = 'extract' AND i.status = 'done') AS done,
       SUM(i.status = 'running') AS running,
       SUM(i.kind = 'extract' AND i.status = 'failed' AND i.attempts >= ${MAX_ATTEMPTS}) AS stuck,
-      MIN(i.fiscal_year) AS y0, MAX(i.fiscal_year) AS y1, MAX(i.updated_at) AS last,
-      (SELECT COUNT(*) FROM results r JOIN items ri USING (item_id)
-        WHERE ri.ticker = c.ticker
-          AND r.created_at >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-${ETA_WINDOW_MIN} minutes')) AS recent
+      MIN(i.fiscal_year) AS y0, MAX(i.fiscal_year) AS y1, MAX(i.updated_at) AS last
     FROM companies c LEFT JOIN items i USING (ticker)
     GROUP BY c.ticker ORDER BY c.seq`
   try {
@@ -342,13 +336,49 @@ function parsePlan(text: string) {
   return { phases, rows }
 }
 
-async function budget($: any, file: string, today: string) {
+type GroqAccount = { account: string; label: string; used: number; active: boolean }
+
+/**
+ * Reads today's Groq usage for each API-key account, for the LLM usage cards.
+ *
+ * Groq's daily token limit belongs to an account, so the runner keeps one budget file per
+ * account in data/state: `budget_groq.json` for the account in use (the "active" one) and
+ * `budget_groq_<fingerprint>.json` for the other one(s). Each file is a refilling bucket
+ * (`level` tokens left as of `updated`, refilling DAILY_LIMIT per 24 h), so used =
+ * limit - (level + refill since `updated`). Labels come from GROQ_ACCOUNT_LABELS in `.env`
+ * ("fingerprint:Name,..."); an account without a label shows its fingerprint. Returns the
+ * active account first, or [] when there is no budget file, so the panel shows a dash.
+ */
+async function readGroqAccounts($: any, dailyLimit = 200000): Promise<GroqAccount[]> {
+  const labels = new Map<string, string>()
   try {
-    const j = JSON.parse(await $.fs.read(`data/state/${file}`))
-    return j.date === today ? Number(j.tokens_used) : 0
-  } catch {
-    return null
+    const m = String(await $.fs.read('.env')).match(/^GROQ_ACCOUNT_LABELS=([^#\n]*)/m)
+    for (const pair of (m?.[1] ?? '').split(',')) {
+      const [fp, name] = pair.split(':').map(x => x.trim().replace(/^["']|["']$/g, ''))
+      if (fp && name) labels.set(fp, name)
+    }
+  } catch {}
+  const files = ['budget_groq.json']
+  try {
+    const ls = await $.process.run(['/bin/ls', 'data/state'], { timeoutMs: 5000 })
+    for (const f of String(ls.stdout).split('\n')) if (/^budget_groq_[0-9a-f]{8}\.json$/.test(f)) files.push(f)
+  } catch {}
+  const out: GroqAccount[] = []
+  for (const f of files) {
+    try {
+      const j = JSON.parse(await $.fs.read(`data/state/${f}`))
+      if (typeof j.level !== 'number' || typeof j.updated !== 'number') continue
+      const refill = ((Date.now() / 1000 - j.updated) * dailyLimit) / 86400
+      const account = String(j.account ?? 'unknown')
+      out.push({
+        account,
+        label: labels.get(account) ?? account,
+        used: Math.max(0, dailyLimit - Math.min(dailyLimit, j.level + refill)),
+        active: f === 'budget_groq.json',
+      })
+    } catch {}
   }
+  return out
 }
 
 export const register: Register = on => {
@@ -382,9 +412,10 @@ export const register: Register = on => {
   // The Extraction pane: how many companies are done, and live detail for the
   // ones being extracted now (backend, % done, years, last activity).
   on('ui.render', { component: 'Pane', requestId: EXT_PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
     await read($, tick)
     await read($, extTick)
+    const closed = await read($, dismissed)
     const w = (e.viewport?.columns ?? 44) - 10
     const now = await $.clock.now()
 
@@ -396,8 +427,7 @@ export const register: Register = on => {
     // Usage meters for the compact LLM usage card: the same sources as the
     // progress pane (Groq's daily budget file, Claude's session limits, agy).
     const agyMeters = await read($, agy)
-    const today = new Date(now).toISOString().slice(0, 10)
-    const groq = await budget($, 'budget_groq.json', today)
+    const groqAccounts = await readGroqAccounts($)
     const limits: { kind: string; percentUsed: number; resetsAt?: string }[] = await $.session
       .usage()
       .then((u: any) => u.rateLimits ?? [])
@@ -409,6 +439,8 @@ export const register: Register = on => {
     // "left" = items still to do; stuck items (out of retries) don't count as left.
     const left = (r: CompanyRow) => (r.total ?? 0) - (r.done ?? 0) - (r.stuck ?? 0)
     const finished = rows.filter(r => (r.total ?? 0) > 0 && left(r) === 0)
+    const caughtKey = `caught:${finished.map(r => r.ticker).join(',')}`
+    const lastKey = `last:${lastRun?.endedAt ?? ''}`
     const active = rows.filter(r => r.backend && left(r) > 0)
     const queued = rows.filter(r => !r.backend && !finished.includes(r))
     const notAdded = Math.max(0, TOTAL_COMPANIES - rows.length)
@@ -433,19 +465,13 @@ export const register: Register = on => {
     const itemsDone = rows.reduce((s, r) => s + (r.done ?? 0), 0)
     const itemsTotal = rows.reduce((s, r) => s + (r.total ?? 0), 0)
 
-    // ETA at the current pace: items left ÷ items finished in the last
-    // ETA_WINDOW_MIN minutes. null when there is no recent pace to go on (a
-    // company just claimed, or its backend paused by a quota).
+    // Formats minutes as "1d 2h", "3h 5m" or "7m".
     const dur = (mins: number) => {
       const m = Math.max(1, Math.round(mins))
       const d = Math.floor(m / 1440)
       const h = Math.floor((m % 1440) / 60)
       return d ? `${d}d ${h}h` : h ? `${h}h ${m % 60}m` : `${m}m`
     }
-    const eta = (itemsLeft: number, recent: number) =>
-      itemsLeft > 0 && recent > 0 ? (itemsLeft / recent) * ETA_WINDOW_MIN : null
-    const itemsLeft = rows.reduce((s, r) => s + Math.max(0, left(r)), 0)
-    const waveEta = eta(itemsLeft, rows.reduce((s, r) => s + (r.recent ?? 0), 0))
 
     const bar = (ratio: number, width: number, color: string) => {
       const f = Math.round(Math.min(1, Math.max(0, ratio)) * width)
@@ -471,11 +497,19 @@ export const register: Register = on => {
         </Text>
       )
     }
-    const card = (title: string, accent: string, body: any) => (
+    // `closeKey` adds a "✕ close" button that hides the card until its key changes.
+    const card = (title: string, accent: string, body: any, closeKey?: string) => (
       <Box flexDirection="column" borderStyle="round" borderColor={C.border} paddingX={1}>
-        <Text bold color={accent}>
-          {title}
-        </Text>
+        <Box justifyContent="space-between">
+          <Text bold color={accent}>
+            {title}
+          </Text>
+          {closeKey && (
+            <Button key={`close:${title}`} onPress={() => update($, dismissed, list => [...list, closeKey])}>
+              <Text color={C.muted}>✕ close</Text>
+            </Button>
+          )}
+        </Box>
         <Box flexDirection="column">{body}</Box>
       </Box>
     )
@@ -562,15 +596,6 @@ export const register: Register = on => {
               Items {itemsDone.toLocaleString()} / {itemsTotal.toLocaleString()}
               {itemsTotal ? ` (${Math.round((itemsDone / itemsTotal) * 100)}%)` : ''}
             </Text>
-            {itemsLeft > 0 && (
-              <Text color={C.muted}>
-                Wave ETA{' '}
-                <Text bold color={C.text}>
-                  {waveEta === null ? '—' : `~${dur(waveEta)}`}
-                </Text>
-                {waveEta === null ? ' (no items finished in the last hour)' : ' at last hour’s pace'}
-              </Text>
-            )}
           </Box>,
         )}
 
@@ -583,13 +608,11 @@ export const register: Register = on => {
               {active.map(r => {
                 const b = backendOf(r.backend)
                 const pct = r.total ? (r.done ?? 0) / r.total : 0
-                const rowEta = eta(left(r), r.recent ?? 0)
                 return (
                   <Box flexDirection="column">
                     <Text color={C.text}>
                       <Text bold>{r.ticker}</Text> <Text color={b.color}>{b.name}</Text>{' '}
                       <Text color={C.muted}>{Math.round(pct * 100)}%</Text>
-                      <Text color={C.muted}> · {rowEta === null ? 'ETA —' : `~${dur(rowEta)} left`}</Text>
                     </Text>
                     {bar(pct, Math.min(24, w), b.color)}
                     <Text color={C.muted}>
@@ -607,11 +630,14 @@ export const register: Register = on => {
             </Box>,
           )}
 
-        {finished.length > 0 && card('Caught up', C.done, tickers(finished))}
+        {finished.length > 0 &&
+          !closed.includes(caughtKey) &&
+          card('Caught up', C.done, tickers(finished), caughtKey)}
 
         {queued.length > 0 && card('Queued', C.muted, tickers(queued))}
 
         {lastRun &&
+          !closed.includes(lastKey) &&
           card(
             'Last run',
             C.more,
@@ -631,17 +657,22 @@ export const register: Register = on => {
                 </Text>
               ))}
             </Box>,
+            lastKey,
           )}
 
         {card(
           'LLM usage',
           C.current,
           <Box flexDirection="column">
-            {usageLine(
-              'Groq today',
-              groq === null ? null : (groq / 200000) * 100,
-              groq === null ? '' : `${Math.round(groq / 1000)}K / 200K`,
-            )}
+            {groqAccounts.length === 0
+              ? usageLine('Groq today', null, '')
+              : groqAccounts.map(g =>
+                  usageLine(
+                    `Groq ${g.label}`,
+                    (g.used / 200000) * 100,
+                    `${Math.round(g.used / 1000)}K / 200K${g.active ? ' · active' : ''}`,
+                  ),
+                )}
             {windowLine('Claude 5h', limits.find(x => x.kind === 'five_hour'))}
             {windowLine('Claude 7d', limits.find(x => x.kind === 'seven_day'))}
             {windowLine('Antigravity 5h', agyMeters?.fiveHour)}
@@ -729,8 +760,7 @@ export const register: Register = on => {
     const hiddenSteps = Math.max(0, steps.length - KEEP)
     const shownSteps = steps.slice(hiddenSteps)
 
-    const today = new Date(await $.clock.now()).toISOString().slice(0, 10)
-    const groq = await budget($, 'budget_groq.json', today)
+    const groqActive = (await readGroqAccounts($))[0] ?? null
     const limits: { kind: string; percentUsed: number; resetsAt?: string }[] = await $.session
       .usage()
       .then((u: any) => u.rateLimits ?? [])
@@ -889,7 +919,7 @@ export const register: Register = on => {
           'LLM usage',
           C.current,
           <Box flexDirection="column" gap={1}>
-            {budgetRow('Groq (today)', groq, 200000)}
+            {budgetRow(groqActive ? `Groq (${groqActive.label})` : 'Groq (today)', groqActive ? groqActive.used : null, 200000)}
             {windowRow('Claude 5-hour', limits.find(x => x.kind === 'five_hour'))}
             {windowRow('Claude 7-day', limits.find(x => x.kind === 'seven_day'))}
             {windowRow('Antigravity 5-hour', agyMeters?.fiveHour)}

@@ -14,8 +14,8 @@ Why it is needed: the rest of the project only talks to `LLMProvider`, so it doe
 on one vendor, and moving to a different LLM needs no code change outside this file. Entity
 extraction (Phase 3) and answer generation will call the LLM through here.
 
-Built-in guards (a simple version; a fuller rate limiter and a response cache are planned
-for the production ingestion pipeline):
+Built-in guards (a simple version; the response cache, `call_cached`, lives in
+`extract/llm_extract.py`):
   - retries with waiting  -> the openai SDK's built-in `max_retries` (Groq only)
   - request pacing        -> at most N requests per minute, per backend
   - tokens per minute     -> waits until the last 60 seconds have room for the next call
@@ -544,7 +544,7 @@ def get_llm(backend: str | None = None) -> LLMProvider:
 
 
 # --------------------------------------------------------------------------------------
-# Smoke test: sends the same prompt to both backends.  Run: .venv/bin/python -m sec10k.llm.providers
+# Smoke test: sends the same prompt to all three backends.  Run: .venv/bin/python -m sec10k.llm.providers
 # --------------------------------------------------------------------------------------
 if __name__ == "__main__":
     system = "You answer in one short sentence."

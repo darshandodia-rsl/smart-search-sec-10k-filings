@@ -15,6 +15,8 @@ declare module 'claude-code' {
       tick: Shaped<number>
       /** Bumped on a timer so the Extraction pane re-reads the job store while idle. */
       extTick: Shaped<number>
+      /** Keys of the Extraction pane cards the user closed; a card returns when its key changes. */
+      dismissed: Shaped<string[]>
       /** The latest Antigravity meter reading; null until the first one lands. */
       agy: Shaped<AgyMeters | null>
     }
