@@ -24,3 +24,6 @@ transformers==5.22.2
 # Local NLP for extraction tier 3 (company / product / place names)
 gliner==0.2.30
 protobuf==7.36.2                          # needed by GLiNER to read its DeBERTa tokenizer
+
+# Entity resolution: hierarchical clustering of risk and theme names (resolve/clusters.py)
+scipy==1.18.1

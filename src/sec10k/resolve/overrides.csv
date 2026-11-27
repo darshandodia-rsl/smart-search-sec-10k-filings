@@ -1,0 +1,3 @@
+name_a,name_b,decision,note
+Microsoft 365 Commercial,Microsoft Office 365 Commercial,SAME,renamed product (Office 365 Commercial became Microsoft 365 Commercial); LLM said DIFFERENT
+Black Duck Software,Black Duck,SAME,the company and its product brand share the name; LLM said SUBSIDIARY_OF

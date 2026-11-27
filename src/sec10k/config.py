@@ -36,8 +36,16 @@ ENTITIES_DIR = DATA / "entities"                     # raw GLiNER entities per f
 ENTITIES_CLEAN_DIR = DATA / "entities_clean"         # cleaned entities per filing, rebuilt from raw
 LLM_CACHE_DIR = DATA / "llm_cache"                   # every LLM answer, keyed by prompt + model (never pay twice)
 EXTRACT_PROTO_DIR = DATA / "extract_proto"           # LLM extraction prototype results (Phase 3)
+RESOLUTION_DIR = DATA / "resolution"                 # entity resolution output: candidate pairs, entity map
+ENTITY_MAP = RESOLUTION_DIR / "entity_map.csv"       # spelling key -> entity; read by the graph writer
+ENTITY_LINKS = RESOLUTION_DIR / "entity_links.csv"   # PRODUCT_OF / SUBSIDIARY_OF links between entities
+CLUSTERS = RESOLUTION_DIR / "clusters.csv"           # risk/theme node -> its cluster; read by the graph writer
 # Hand-checked names each corpus company goes by (in git, next to the code that uses it).
 COMPANY_ALIASES = ROOT / "src" / "sec10k" / "extract" / "company_aliases.csv"
+# Hand decisions on entity pairs (in git); they always beat rules and the LLM.
+ENTITY_OVERRIDES = ROOT / "src" / "sec10k" / "resolve" / "overrides.csv"
+# Hand-checked spellings of places -> one canonical place (in git); read by the graph writer.
+GEOGRAPHY_ALIASES = ROOT / "src" / "sec10k" / "resolve" / "geography_aliases.csv"
 
 # The local embedding model and the size of the vectors it produces. The chunker measures
 # chunk sizes with this model's tokenizer, so chunker and embedder must use the same model.
